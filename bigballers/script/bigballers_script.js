@@ -2511,15 +2511,16 @@ Il2Cpp.perform(() => {
     }
 
     function releaseFormation(formation, stopMotion) {
-        if (stopMotion) {
-            for (const entry of formation.balls.values()) {
-                if (!entry.owned || entry.kinematic || !unityAlive(entry.rigidbody))
-                    continue;
-                try {
-                    U.rbSetVelocity(entry.rigidbody, [0, 0, 0]);
+        for (const entry of formation.balls.values()) {
+            try {
+                if (unityAlive(entry.rigidbody)) {
+                    if (U.rbSetUseGravity)
+                        U.rbSetUseGravity(entry.rigidbody, 1);
+                    if (stopMotion)
+                        U.rbSetVelocity(entry.rigidbody, [0, 0, 0]);
                 }
-                catch (_) { }
             }
+            catch (_) { }
         }
         formation.balls.clear();
         formation.nextScan = 0;
@@ -2530,16 +2531,11 @@ Il2Cpp.perform(() => {
     const releaseOrbitBalls = (stopMotion) => releaseFormation(orbit, stopMotion);
     const releaseBallStack = (stopMotion) => releaseFormation(ballStack, stopMotion);
 
-    let formationForceGrabbing = false;
-
     function forceClaimBall(entry) {
-        formationForceGrabbing = true;
         try {
             // 1. Break active hold from any player's hand (steal)
             if (G.ballClearHeld && G.ballClearHeld.available)
                 G.ballClearHeld(entry.ball);
-            if (G.ballAutoRelease && G.ballAutoRelease.available)
-                G.ballAutoRelease(entry.ball);
             if (G.ballTakeControlPhysics && G.ballTakeControlPhysics.available)
                 G.ballTakeControlPhysics(entry.ball);
 
@@ -2551,20 +2547,12 @@ Il2Cpp.perform(() => {
             if (G.ballRequestOwnershipIfAllowed && G.ballRequestOwnershipIfAllowed.available)
                 G.ballRequestOwnershipIfAllowed(entry.ball);
 
-            // 3. Force-grab into grabber to claim authority over Normcore
-            const grabber = freeGrabber() || refs.grabberRight || refs.grabberLeft;
-            if (unityAlive(grabber) && G.ballForceGrab && G.ballForceGrab.available) {
-                G.ballForceGrab(entry.ball, grabber);
-                if (G.ballClearHeld && G.ballClearHeld.available)
-                    G.ballClearHeld(entry.ball);
-                if (G.ballAutoRelease && G.ballAutoRelease.available)
-                    G.ballAutoRelease(entry.ball);
-            }
-
-            // 4. Wake up physics & unlock kinematic
+            // 3. Disable gravity and unlock kinematic so it floats in formation without falling
             if (unityAlive(entry.rigidbody)) {
                 if (U.rbWakeUp && U.rbWakeUp.available)
                     U.rbWakeUp(entry.rigidbody);
+                if (U.rbSetUseGravity && U.rbSetUseGravity.available)
+                    U.rbSetUseGravity(entry.rigidbody, 0);
                 if (entry.kinematic && U.rbSetIsKinematic && U.rbSetIsKinematic.available) {
                     U.rbSetIsKinematic(entry.rigidbody, 0);
                     entry.kinematic = false;
@@ -2572,9 +2560,6 @@ Il2Cpp.perform(() => {
             }
         }
         catch (_) { }
-        finally {
-            formationForceGrabbing = false;
-        }
     }
 
     function formationEligible(ball, now) {
@@ -2665,22 +2650,30 @@ Il2Cpp.perform(() => {
             formation.nextScan = now + ORBIT_RESCAN_SECONDS;
             rescanFormation(formation, now, center);
         }
-        const count = formation.balls.size;
-        let slot = 0;
-        for (const [key, entry] of formation.balls) {
-            const index = slot++;
+        const balls = Array.from(formation.balls.entries());
+        const count = balls.length;
+        for (let index = 0; index < count; index++) {
+            const [key, entry] = balls[index];
             const released = recentReleases.get(key);
             if (!unityAlive(entry.ball) || !unityAlive(entry.rigidbody) || autoAim.guidedKeys.has(key) ||
                 (released !== undefined && now - released < ORBIT_RELEASE_GRACE_SECONDS)) {
                 formation.balls.delete(key);
+                try {
+                    if (U.rbSetUseGravity)
+                        U.rbSetUseGravity(entry.rigidbody, 1);
+                }
+                catch (_) { }
                 continue;
             }
-            if (now >= entry.nextCheck && !refreshFormationOwnership(key, entry, now)) {
-                formation.balls.delete(key);
-                continue;
+            if (now >= entry.nextCheck) {
+                refreshFormationOwnership(key, entry, now);
             }
             const { target, drift } = place(index, count, now, center);
             try {
+                // Ensure gravity remains off while in formation so balls never fall to the floor
+                if (U.rbSetUseGravity)
+                    U.rbSetUseGravity(entry.rigidbody, 0);
+
                 if (entry.kinematic) {
                     U.rbMovePosition(entry.rigidbody, target);
                     continue;
@@ -2696,17 +2689,19 @@ Il2Cpp.perform(() => {
                 }
                 U.rbSetVelocity(entry.rigidbody, velocity);
                 if (G.ballSetVelocities && G.ballSetVelocities.available) {
-                    G.ballSetVelocities(entry.ball, velocity, [0, 0, 0]);
+                    try {
+                        G.ballSetVelocities(entry.ball, velocity, [0, 0, 0]);
+                    }
+                    catch (_) { }
                 }
             }
-            catch (_) {
-                formation.balls.delete(key);
-            }
+            catch (_) { }
         }
     }
 
     function orbitPlacement(index, count, now, center) {
-        const angle = now * ORBIT_ANGULAR_SPEED + index * (2 * Math.PI / count);
+        const total = Math.max(1, count);
+        const angle = now * ORBIT_ANGULAR_SPEED + index * (2 * Math.PI / total);
         const bob = now * ORBIT_BOB_SPEED + index * 1.2;
         return {
             target: [
@@ -2725,8 +2720,8 @@ Il2Cpp.perform(() => {
     // Rings of up to BALL_STACK_PER_RING balls stacked above your head, turning slowly.
     function stackPlacement(index, count, now, center) {
         const ring = Math.floor(index / BALL_STACK_PER_RING);
-        const inRing = Math.min(BALL_STACK_PER_RING, count - ring * BALL_STACK_PER_RING);
-        const angle = now * BALL_STACK_SPIN + (index % BALL_STACK_PER_RING) * (2 * Math.PI / inRing) + ring * 0.5;
+        const slotInRing = index % BALL_STACK_PER_RING;
+        const angle = now * BALL_STACK_SPIN + slotInRing * (2 * Math.PI / BALL_STACK_PER_RING) + ring * 0.5;
         return {
             target: [
                 center[0] + Math.cos(angle) * BALL_STACK_RADIUS,
@@ -2792,10 +2787,12 @@ Il2Cpp.perform(() => {
         if (!hoop)
             return false;
         for (const [key, entry] of ballStack.balls) {
-            if (!entry.owned || entry.kinematic || !unityAlive(entry.rigidbody))
+            if (entry.kinematic || !unityAlive(entry.rigidbody))
                 continue;
             let launched = false;
             try {
+                if (U.rbSetUseGravity)
+                    U.rbSetUseGravity(entry.rigidbody, 1);
                 launched = launchAtHoop(entry.ball, entry.rigidbody, U.rbPosition(entry.rigidbody), null, now, { forced: true, hoop });
             }
             catch (_) {
