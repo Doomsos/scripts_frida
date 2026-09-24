@@ -77,7 +77,17 @@ Il2Cpp.perform(() => {
     const AUTO_AIM_METERS_PER_SECOND = 24.0;
     const AUTO_AIM_GATE_HEIGHT = 0.55;
     const AUTO_AIM_GATE_DROP_SPEED = 3.25;
-    const AUTO_AIM_OWNERSHIP_ATTEMPTS = 4;
+    // Swish shots come down into the hoop at least this steeply, so the arc scores on its own even
+    // if the in-flight guidance never gets to run (server lag, ownership still on its way).
+    const AUTO_AIM_MIN_ENTRY_DEGREES = 47;
+    const AUTO_AIM_ENTRY_HEIGHT = 0.08;
+    // While a shot is ours it's held to the planned arc: anything that knocks it off (the game's own
+    // throw velocity landing late, a laggy correction) gets steered back.
+    const AUTO_AIM_PATH_TOLERANCE = 0.25;
+    const AUTO_AIM_VELOCITY_TOLERANCE = 1.5;
+    const AUTO_AIM_PATH_GAIN = 5.0;
+    const AUTO_AIM_PATH_MAX_SPEED = 30.0;
+    const AUTO_AIM_OWNERSHIP_RETRY_SECONDS = 0.3;
     const HOOP_CACHE_SECONDS = 5.0;
     const POINTS_PER_SHOT_CHOICES = [1, 2, 4, 6, 8, 10, 12];
 
@@ -91,14 +101,8 @@ Il2Cpp.perform(() => {
     const ORBIT_GAIN = 8.0;
     const ORBIT_MAX_SPEED = 25.0;
     const ORBIT_RESCAN_SECONDS = 0.5;
-    const ORBIT_OWNERSHIP_CHECK_SECONDS = 0.25;
-    // Ownership requests share one budget, so a lobby full of balls is claimed over a few seconds
-    // instead of flooding the room server, and a ball that keeps refusing waits longer each time.
-    const ORBIT_OWNERSHIP_REQUESTS_PER_SECOND = 6;
-    const ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS = 1.0;
-    const ORBIT_OWNERSHIP_BACKOFF_MAX_SECONDS = 8.0;
-    // Someone else's ball moving faster than this is a shot or a pass; it's left alone until it lands.
-    const ORBIT_CLAIM_MAX_SPEED = 3.0;
+    const ORBIT_OWNERSHIP_CHECK_SECONDS = 0.2;
+    const ORBIT_OWNERSHIP_RETRY_SECONDS = 1.0;
     const ORBIT_RELEASE_GRACE_SECONDS = 3.0;
 
     // Ball stack: balls held in spinning rings above your head, fired at the hoop while RT is held.
@@ -661,6 +665,7 @@ Il2Cpp.perform(() => {
         SphereCollider: requireClass(images.physics, "UnityEngine.SphereCollider"),
         CapsuleCollider: requireClass(images.physics, "UnityEngine.CapsuleCollider"),
         Physics: requireClass(images.physics, "UnityEngine.Physics"),
+        Time: findClass(images.core, "UnityEngine.Time"),
         Canvas: requireClass(images.uiModule, "UnityEngine.Canvas"),
         CanvasScaler: requireClass(images.ui, "UnityEngine.UI.CanvasScaler"),
         Graphic: requireClass(images.ui, "UnityEngine.UI.Graphic"),
@@ -753,6 +758,7 @@ Il2Cpp.perform(() => {
         rbDamping: bind(Unity.Rigidbody, "get_linearDamping", 0),
         rbMovePosition: bind(Unity.Rigidbody, "MovePosition", 1),
         gravity: bind(Unity.Physics, "get_gravity", 0),
+        fixedDeltaTime: bind(Unity.Time, "get_fixedDeltaTime", 0),
         syncTransforms: bind(Unity.Physics, "SyncTransforms", 0),
         ignoreCollision: bind(Unity.Physics, "IgnoreCollision", 3),
         boxSize: bind(Unity.BoxCollider, "get_size", 0),
@@ -1277,7 +1283,6 @@ Il2Cpp.perform(() => {
         Grabber: findClass(images.game, "BNG.Grabber"),
         NCGrabbable: requireClass(images.game, "NCGrabbable"),
         BallController: requireClass(images.game, "BallController"),
-        RealtimeTransform: findClass(openImage("Normal.Realtime"), "Normal.Realtime.RealtimeTransform"),
         NCNetworkPlayer: requireClass(images.game, "NCNetworkPlayer"),
         NCNetworkPlayerData: findClass(images.game, "NCNetworkPlayerData"),
         NCNetworkPlayerDataController: findClass(images.game, "NCNetworkPlayerDataController"),
@@ -1301,9 +1306,6 @@ Il2Cpp.perform(() => {
     };
 
     const OFF = {
-        realtimeTransform: {
-            keepOwnershipAsleep: fieldOffset(Game.RealtimeTransform, "_maintainOwnershipWhileSleeping"),
-        },
         hand: {
             left: fieldOffset(Game.HandManager, "HandL"),
             right: fieldOffset(Game.HandManager, "HandR"),
@@ -1336,7 +1338,6 @@ Il2Cpp.perform(() => {
         },
         ball: {
             rb: fieldOffset(Game.NCGrabbable, "rb"),
-            realtimeTransform: fieldOffset(Game.NCGrabbable, "realtimeTransform"),
             grabbable: fieldOffset(Game.NCGrabbable, "grabbable"),
             sphereCollider: fieldOffset(Game.NCGrabbable, "sphereCollider"),
             throwingMultiplier: fieldOffset(Game.NCGrabbable, "throwingMultiplier"),
@@ -1409,7 +1410,6 @@ Il2Cpp.perform(() => {
         ballOwnedLocally: bind(Game.NCGrabbable, "NTIsOwnedLocally", 0),
         ballRequestOwnershipIfAllowed: bind(Game.NCGrabbable, "NTNVRequestOwnershipIfAllowed", 0),
         ballRequestTransformOwnership: bind(Game.NCGrabbable, "NetworkedTransformRequestOwnership", 0),
-        ballUnowned: bind(Game.NCGrabbable, "NTIsUnOwned", 0),
         ballSetVelocities: bind(Game.NCGrabbable, "SetRbVelocityAndAngularVelocity", 2),
         ballShotByLocalPlayer: bind(Game.NCGrabbable, "wasShotByLocalPlayer", 0),
         playerData: bind(Game.NCNetworkPlayer, "GetPlayerData", 0),
@@ -2163,7 +2163,7 @@ Il2Cpp.perform(() => {
         return { target, boardDirection };
     }
 
-    function computeAimVelocity(start, target, flightTime, rigidbody, ball) {
+    function ballPhysics(rigidbody, ball) {
         let gravity = U.gravity();
         if (OFF.ball.gravity >= 0) {
             const override = readVector3At(ball, OFF.ball.gravity);
@@ -2175,6 +2175,43 @@ Il2Cpp.perform(() => {
             damping = Math.max(0, Number(U.rbDamping(rigidbody)) || 0);
         }
         catch (_) { }
+        let step = 0.02;
+        try {
+            if (U.fixedDeltaTime.available)
+                step = clamp(Number(U.fixedDeltaTime()) || 0.02, 0.005, 0.05);
+        }
+        catch (_) { }
+        return { gravity, damping, step };
+    }
+
+    // Where a ball launched from `start` at `velocity` is, and how fast it's going, `time` seconds later.
+    function ballisticState(start, velocity, { gravity, damping }, time) {
+        if (damping < 0.0001) {
+            return {
+                position: [0, 1, 2].map((axis) => start[axis] + velocity[axis] * time + 0.5 * gravity[axis] * time * time),
+                velocity: [0, 1, 2].map((axis) => velocity[axis] + gravity[axis] * time),
+            };
+        }
+        const decay = Math.exp(-damping * time);
+        return {
+            position: [0, 1, 2].map((axis) => {
+                const terminal = gravity[axis] / damping;
+                return start[axis] + terminal * time + (velocity[axis] - terminal) * (1 - decay) / damping;
+            }),
+            velocity: [0, 1, 2].map((axis) => gravity[axis] / damping + (velocity[axis] - gravity[axis] / damping) * decay),
+        };
+    }
+
+    // The flight time that brings the ball down into `target` at `degrees` below horizontal.
+    function steepArcTime(start, target, gravity, degrees) {
+        const g = Math.max(1, Math.hypot(gravity[0], gravity[1], gravity[2]));
+        const horizontal = Math.hypot(target[0] - start[0], target[2] - start[2]);
+        const rise = target[1] - start[1];
+        return Math.sqrt(Math.max(0.1, 2 * (rise + horizontal * Math.tan(degrees * Math.PI / 180)) / g));
+    }
+
+    function computeAimVelocity(start, target, flightTime, physics) {
+        const { gravity, damping } = physics;
         const time = Math.max(0.35, flightTime);
         if (damping < 0.0001) {
             return [0, 1, 2].map((axis) => (target[axis] - start[axis]) / time - 0.5 * gravity[axis] * time);
@@ -2222,7 +2259,7 @@ Il2Cpp.perform(() => {
         return result;
     }
 
-    function trackGuidedBall(ball, rigidbody, hoop, flightTime, backboardTarget, boardDirection, now, forced) {
+    function trackGuidedBall(ball, rigidbody, hoop, flightTime, backboardTarget, boardDirection, now, forced, plan) {
         const key = keyOf(ball);
         for (let index = autoAim.guided.length - 1; index >= 0; index--) {
             if (autoAim.guided[index].key === key)
@@ -2236,34 +2273,57 @@ Il2Cpp.perform(() => {
             expiresAt: now + flightTime + 2.0,
             terminal: false,
             bounced: false,
-            ownershipAttempts: 0,
+            nextOwnershipRequest: 0,
             backboardTarget,
             boardDirection,
             forced,
+            plan,
         });
         autoAim.guidedKeys.add(key);
     }
 
-    // true when owned, false when ownership was refused, null while still asking.
-    function ensureGuidedOwnership(guided) {
+    // true once the ball is ours. Until then it keeps asking every AUTO_AIM_OWNERSHIP_RETRY_SECONDS
+    // (the shot's arc scores by itself meanwhile), so a slow server answer doesn't cancel the guidance.
+    function ensureGuidedOwnership(guided, now) {
         try {
             if (G.ballOwnedLocally(guided.ball))
                 return true;
         }
         catch (_) { }
-        try {
-            G.ballRequestOwnershipIfAllowed(guided.ball);
+        if (now >= guided.nextOwnershipRequest) {
+            guided.nextOwnershipRequest = now + AUTO_AIM_OWNERSHIP_RETRY_SECONDS;
+            try {
+                G.ballRequestOwnershipIfAllowed(guided.ball);
+            }
+            catch (_) { }
         }
-        catch (_) { }
-        guided.ownershipAttempts++;
-        if (guided.ownershipAttempts < AUTO_AIM_OWNERSHIP_ATTEMPTS)
-            return null;
-        try {
-            return !!G.ballOwnedLocally(guided.ball);
+        return false;
+    }
+
+    // Steers the ball back onto its planned arc when something knocked it off.
+    function followPlannedArc(guided, position, velocity, now) {
+        const plan = guided.plan;
+        const elapsed = now - plan.launchedAt;
+        if (elapsed < 0 || elapsed > plan.followUntil)
+            return;
+        const planned = ballisticState(plan.start, plan.velocity, plan.physics, elapsed);
+        // Same physics-step sag the launch aimed above.
+        const offset = [0, 1, 2].map((axis) => planned.position[axis] + 0.5 * plan.physics.gravity[axis] * plan.physics.step * elapsed - position[axis]);
+        const drift = Math.hypot(offset[0], offset[1], offset[2]);
+        const speedError = Math.hypot(planned.velocity[0] - velocity[0], planned.velocity[1] - velocity[1], planned.velocity[2] - velocity[2]);
+        if (drift <= AUTO_AIM_PATH_TOLERANCE && speedError <= AUTO_AIM_VELOCITY_TOLERANCE)
+            return;
+        if (!ensureGuidedOwnership(guided, now))
+            return;
+        const corrected = [0, 1, 2].map((axis) => planned.velocity[axis] + offset[axis] * AUTO_AIM_PATH_GAIN);
+        const speed = Math.hypot(corrected[0], corrected[1], corrected[2]);
+        if (speed > AUTO_AIM_PATH_MAX_SPEED) {
+            const scale = AUTO_AIM_PATH_MAX_SPEED / speed;
+            corrected[0] *= scale;
+            corrected[1] *= scale;
+            corrected[2] *= scale;
         }
-        catch (_) {
-            return false;
-        }
+        U.rbSetVelocity(guided.rigidbody, corrected);
     }
 
     // Guidance keeps running for balls released with LT held, even after LT is let go. Balls
@@ -2294,6 +2354,8 @@ Il2Cpp.perform(() => {
                 const position = U.rbPosition(guided.rigidbody);
                 const velocity = U.rbVelocity(guided.rigidbody);
                 const hoop = guided.hoop;
+                if (!guided.terminal && !guided.bounced && guided.plan)
+                    followPlannedArc(guided, position, velocity, now);
                 if (settings.autoAimMode === 1 && guided.backboardTarget && guided.boardDirection && !guided.bounced) {
                     const toBoardX = guided.backboardTarget[0] - position[0];
                     const toBoardZ = guided.backboardTarget[2] - position[2];
@@ -2312,13 +2374,8 @@ Il2Cpp.perform(() => {
                         horizontalDistance <= captureDistance &&
                         position[1] >= hoop[1] + 0.30 &&
                         position[1] <= hoop[1] + 2.25) {
-                        const owned = ensureGuidedOwnership(guided);
-                        if (owned === null)
+                        if (!ensureGuidedOwnership(guided, now))
                             continue;
-                        if (!owned) {
-                            removeGuidedBall(index);
-                            continue;
-                        }
                         if (settings.autoAimLegit === 0)
                             U.rbSetPosition(guided.rigidbody, [hoop[0], hoop[1] + AUTO_AIM_GATE_HEIGHT, hoop[2]]);
                         guided.terminal = true;
@@ -2326,13 +2383,8 @@ Il2Cpp.perform(() => {
                 }
                 if (!guided.terminal)
                     continue;
-                const owned = ensureGuidedOwnership(guided);
-                if (owned === null)
+                if (!ensureGuidedOwnership(guided, now))
                     continue;
-                if (!owned) {
-                    removeGuidedBall(index);
-                    continue;
-                }
                 const current = U.rbPosition(guided.rigidbody);
                 const angularVelocity = U.rbAngularVelocity(guided.rigidbody);
                 if (settings.autoAimLegit === 0) {
@@ -2373,8 +2425,9 @@ Il2Cpp.perform(() => {
             aimTarget = backboardTarget;
         }
         else {
-            aimTarget = [hoop[0], hoop[1] + AUTO_AIM_GATE_HEIGHT, hoop[2]];
+            aimTarget = [hoop[0], hoop[1] + AUTO_AIM_ENTRY_HEIGHT, hoop[2]];
         }
+        const physics = ballPhysics(rigidbody, ball);
         let flightTime = aimFlightTime(start, aimTarget);
         if (releaseVelocity && Math.hypot(hoop[0] - start[0], hoop[2] - start[2]) >= 1.6) {
             // Flat release shoots flatter; jump shots keep the natural time but get flattened a
@@ -2384,7 +2437,12 @@ Il2Cpp.perform(() => {
             const heightFactor = clamp((start[1] - (hoop[1] - 0.8)) * randomScale, 0, 0.30);
             flightTime = Math.max(0.18, flightTime + arcFactor - heightFactor);
         }
-        const aimed = computeAimVelocity(start, aimTarget, flightTime, rigidbody, ball);
+        if (settings.autoAimMode === 0)
+            flightTime = Math.max(flightTime, steepArcTime(start, aimTarget, physics.gravity, AUTO_AIM_MIN_ENTRY_DEGREES));
+        // The physics step adds velocity before moving the ball, so over a flight it ends up
+        // ½·g·step·T below the exact arc; aim that much higher to land where the arc says.
+        const stepTarget = [0, 1, 2].map((axis) => aimTarget[axis] - 0.5 * physics.gravity[axis] * physics.step * flightTime);
+        const aimed = computeAimVelocity(start, stepTarget, flightTime, physics);
         let spin = angularVelocity;
         const horizontalSpeed = Math.hypot(aimed[0], aimed[2]);
         if (horizontalSpeed > 0.05) {
@@ -2393,11 +2451,20 @@ Il2Cpp.perform(() => {
             spin = [-(aimed[2] / horizontalSpeed) * spinSpeed, angularVelocity[1] * 0.4, (aimed[0] / horizontalSpeed) * spinSpeed];
         }
         try {
-            G.ballRequestOwnershipIfAllowed(ball);
+            if (!G.ballOwnedLocally(ball))
+                G.ballRequestOwnershipIfAllowed(ball);
         }
         catch (_) { }
         G.ballSetVelocities(ball, aimed, spin);
-        trackGuidedBall(ball, rigidbody, hoop, flightTime, backboardTarget, boardDirection, now, forced);
+        // A bank shot is followed until just before the board, so the bounce stays natural.
+        const plan = {
+            start,
+            velocity: aimed,
+            physics,
+            launchedAt: now,
+            followUntil: Math.max(0, flightTime - (settings.autoAimMode === 1 ? 0.12 : 0.05)),
+        };
+        trackGuidedBall(ball, rigidbody, hoop, flightTime, backboardTarget, boardDirection, now, forced, plan);
         return true;
     }
 
@@ -2450,7 +2517,8 @@ Il2Cpp.perform(() => {
                 }
             }
             recentReleases.set(keyOf(ball), now);
-            leaveFormations(keyOf(ball));
+            orbit.balls.delete(keyOf(ball));
+            ballStack.balls.delete(keyOf(ball));
             if (!modify || !aim || !unityAlive(rigidbody))
                 return result;
             try {
@@ -2463,7 +2531,13 @@ Il2Cpp.perform(() => {
         });
         // A ball you grab leaves the orbit or stack on the spot instead of at the next ownership check.
         hookMethod(Game.NCGrabbable, "OnGrab", 1, null, (original) => function (grabber) {
-            leaveFormations(keyOf(this));
+            for (const formation of [orbit, ballStack]) {
+                const entry = formation.balls.get(keyOf(this));
+                if (entry) {
+                    restoreGravity(entry);
+                    formation.balls.delete(keyOf(this));
+                }
+            }
             return original(this, grabber);
         });
     }
@@ -2471,10 +2545,9 @@ Il2Cpp.perform(() => {
     // ─────────────────────────────── Ball orbit & ball stack ───────────────────────────────
 
     // Both pull every ball nobody is holding into a formation around you with rigidbody velocity, so
-    // Normcore keeps interpolating them for everyone. Ownership is checked locally a few times a
-    // second; requests come out of a shared budget with a growing wait per ball, and a ball stays ours
-    // once claimed. Only balls we own are moved (moving anyone else's just gets snapped back), and
-    // held, guided, freshly thrown or in-flight balls are never touched.
+    // Normcore keeps interpolating them for everyone. Ownership is checked a few times a second and
+    // asked for at most once a second per ball; only balls we own are moved (moving anyone else's
+    // just gets snapped back), and held, guided or freshly thrown balls are never touched.
     const orbit = { balls: new Map(), nextScan: 0 };
     // Stack balls ignore each other's colliders (every ball that joined, in the stack or in flight),
     // so they don't knock each other away from the hoop. Restored when the stack is let go.
@@ -2519,69 +2592,21 @@ Il2Cpp.perform(() => {
         ballStack.colliders.clear();
     }
 
-    // Normcore drops ownership of a ball that falls asleep, which would mean claiming it all over
-    // again; formation balls keep it while they're ours. A local flag, nothing goes over the network.
-    function keepOwnershipAsleep(entry) {
-        if (entry.sleepFlag !== null || OFF.realtimeTransform.keepOwnershipAsleep < 0 || OFF.ball.realtimeTransform < 0)
+    // Formation balls float without gravity while we move them; it comes back when they leave.
+    function restoreGravity(entry) {
+        if (!entry.gravityOff)
             return;
+        entry.gravityOff = false;
         try {
-            const transform = readPointerAt(entry.ball, OFF.ball.realtimeTransform);
-            if (!unityAlive(transform))
-                return;
-            entry.sleepFlag = readBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep);
-            writeBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep, true);
+            if (unityAlive(entry.rigidbody))
+                U.rbSetUseGravity(entry.rigidbody, 1);
         }
         catch (_) { }
     }
 
-    // Formation balls float without gravity while we move them; gravity and the sleep setting come
-    // back when they leave.
-    function restoreBall(entry) {
-        if (entry.gravityOff) {
-            entry.gravityOff = false;
-            try {
-                if (unityAlive(entry.rigidbody))
-                    U.rbSetUseGravity(entry.rigidbody, 1);
-            }
-            catch (_) { }
-        }
-        if (entry.sleepFlag !== null) {
-            const flag = entry.sleepFlag;
-            entry.sleepFlag = null;
-            try {
-                const transform = readPointerAt(entry.ball, OFF.ball.realtimeTransform);
-                if (unityAlive(transform))
-                    writeBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep, flag);
-            }
-            catch (_) { }
-        }
-    }
-
-    function leaveFormations(key) {
-        for (const formation of [orbit, ballStack]) {
-            const entry = formation.balls.get(key);
-            if (entry) {
-                restoreBall(entry);
-                formation.balls.delete(key);
-            }
-        }
-    }
-
-    const ownershipBudget = { tokens: ORBIT_OWNERSHIP_REQUESTS_PER_SECOND, time: 0 };
-
-    function takeOwnershipRequest(now) {
-        ownershipBudget.tokens = Math.min(ORBIT_OWNERSHIP_REQUESTS_PER_SECOND,
-            ownershipBudget.tokens + (now - ownershipBudget.time) * ORBIT_OWNERSHIP_REQUESTS_PER_SECOND);
-        ownershipBudget.time = now;
-        if (ownershipBudget.tokens < 1)
-            return false;
-        ownershipBudget.tokens -= 1;
-        return true;
-    }
-
     function releaseFormation(formation, stopMotion) {
         for (const entry of formation.balls.values()) {
-            restoreBall(entry);
+            restoreGravity(entry);
             if (!stopMotion || !entry.owned || entry.kinematic || !unityAlive(entry.rigidbody))
                 continue;
             try {
@@ -2623,7 +2648,7 @@ Il2Cpp.perform(() => {
         const chosenKeys = new Set(chosen.map((ball) => ball.key));
         for (const [key, entry] of formation.balls) {
             if (!chosenKeys.has(key)) {
-                restoreBall(entry);
+                restoreGravity(entry);
                 formation.balls.delete(key);
             }
         }
@@ -2639,17 +2664,15 @@ Il2Cpp.perform(() => {
                 owned: false,
                 kinematic: false,
                 gravityOff: false,
-                sleepFlag: null,
-                backoff: ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS,
                 nextCheck: now + Math.random() * ORBIT_OWNERSHIP_CHECK_SECONDS,
-                nextRequest: now,
+                nextRequest: now + Math.random() * ORBIT_OWNERSHIP_RETRY_SECONDS,
             });
         }
     }
 
-    // Physics only needs the ball's RealtimeTransform. The game's "if allowed" request also asks for
-    // the view and clears it again right away (the view owner is whoever holds the ball), so it costs
-    // three messages; the transform request alone is one, and it comes out of the shared budget.
+    // A dropped ball's view often stays with its last holder, and Normcore won't hand over the
+    // transform while the view belongs to someone else, so both are asked for (the game's own
+    // "if allowed" request, which only goes through when nobody holds the ball).
     function refreshFormationOwnership(key, entry, now) {
         entry.nextCheck = now + ORBIT_OWNERSHIP_CHECK_SECONDS;
         let held = true;
@@ -2666,31 +2689,17 @@ Il2Cpp.perform(() => {
         catch (_) {
             entry.owned = false;
         }
-        if (entry.owned) {
-            entry.backoff = ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS;
-            keepOwnershipAsleep(entry);
-            return true;
-        }
-        if (now < entry.nextRequest)
-            return true;
-        try {
-            if (!G.ballUnowned(entry.ball)) {
-                const velocity = U.rbVelocity(entry.rigidbody);
-                if (Math.hypot(velocity[0], velocity[1], velocity[2]) > ORBIT_CLAIM_MAX_SPEED)
-                    return true;
+        if (!entry.owned && now >= entry.nextRequest) {
+            entry.nextRequest = now + ORBIT_OWNERSHIP_RETRY_SECONDS;
+            try {
+                G.ballRequestOwnershipIfAllowed(entry.ball);
             }
+            catch (_) { }
+            try {
+                G.ballRequestTransformOwnership(entry.ball);
+            }
+            catch (_) { }
         }
-        catch (_) {
-            return true;
-        }
-        if (!takeOwnershipRequest(now))
-            return true;
-        entry.nextRequest = now + entry.backoff;
-        entry.backoff = Math.min(entry.backoff * 2, ORBIT_OWNERSHIP_BACKOFF_MAX_SECONDS);
-        try {
-            G.ballRequestTransformOwnership(entry.ball);
-        }
-        catch (_) { }
         return true;
     }
 
@@ -2707,7 +2716,7 @@ Il2Cpp.perform(() => {
             if (!unityAlive(entry.ball) || !unityAlive(entry.rigidbody) || autoAim.guidedKeys.has(key) ||
                 (released !== undefined && now - released < ORBIT_RELEASE_GRACE_SECONDS) ||
                 (now >= entry.nextCheck && !refreshFormationOwnership(key, entry, now))) {
-                restoreBall(entry);
+                restoreGravity(entry);
                 formation.balls.delete(key);
                 continue;
             }
@@ -2737,7 +2746,7 @@ Il2Cpp.perform(() => {
                 U.rbSetVelocity(entry.rigidbody, velocity);
             }
             catch (_) {
-                restoreBall(entry);
+                restoreGravity(entry);
                 formation.balls.delete(key);
             }
         });
@@ -2835,7 +2844,7 @@ Il2Cpp.perform(() => {
                 continue;
             let launched = false;
             try {
-                restoreBall(entry);
+                restoreGravity(entry);
                 launched = launchAtHoop(entry.ball, entry.rigidbody, U.rbPosition(entry.rigidbody), null, now, { forced: true, hoop });
             }
             catch (_) {
