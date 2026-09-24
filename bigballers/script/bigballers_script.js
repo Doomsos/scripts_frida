@@ -91,8 +91,14 @@ Il2Cpp.perform(() => {
     const ORBIT_GAIN = 8.0;
     const ORBIT_MAX_SPEED = 25.0;
     const ORBIT_RESCAN_SECONDS = 0.5;
-    const ORBIT_OWNERSHIP_CHECK_SECONDS = 0.2;
-    const ORBIT_OWNERSHIP_RETRY_SECONDS = 1.0;
+    const ORBIT_OWNERSHIP_CHECK_SECONDS = 0.25;
+    // Ownership requests share one budget, so a lobby full of balls is claimed over a few seconds
+    // instead of flooding the room server, and a ball that keeps refusing waits longer each time.
+    const ORBIT_OWNERSHIP_REQUESTS_PER_SECOND = 6;
+    const ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS = 1.0;
+    const ORBIT_OWNERSHIP_BACKOFF_MAX_SECONDS = 8.0;
+    // Someone else's ball moving faster than this is a shot or a pass; it's left alone until it lands.
+    const ORBIT_CLAIM_MAX_SPEED = 3.0;
     const ORBIT_RELEASE_GRACE_SECONDS = 3.0;
 
     // Ball stack: balls held in spinning rings above your head, fired at the hoop while RT is held.
@@ -1271,6 +1277,7 @@ Il2Cpp.perform(() => {
         Grabber: findClass(images.game, "BNG.Grabber"),
         NCGrabbable: requireClass(images.game, "NCGrabbable"),
         BallController: requireClass(images.game, "BallController"),
+        RealtimeTransform: findClass(openImage("Normal.Realtime"), "Normal.Realtime.RealtimeTransform"),
         NCNetworkPlayer: requireClass(images.game, "NCNetworkPlayer"),
         NCNetworkPlayerData: findClass(images.game, "NCNetworkPlayerData"),
         NCNetworkPlayerDataController: findClass(images.game, "NCNetworkPlayerDataController"),
@@ -1294,6 +1301,9 @@ Il2Cpp.perform(() => {
     };
 
     const OFF = {
+        realtimeTransform: {
+            keepOwnershipAsleep: fieldOffset(Game.RealtimeTransform, "_maintainOwnershipWhileSleeping"),
+        },
         hand: {
             left: fieldOffset(Game.HandManager, "HandL"),
             right: fieldOffset(Game.HandManager, "HandR"),
@@ -1326,6 +1336,7 @@ Il2Cpp.perform(() => {
         },
         ball: {
             rb: fieldOffset(Game.NCGrabbable, "rb"),
+            realtimeTransform: fieldOffset(Game.NCGrabbable, "realtimeTransform"),
             grabbable: fieldOffset(Game.NCGrabbable, "grabbable"),
             sphereCollider: fieldOffset(Game.NCGrabbable, "sphereCollider"),
             throwingMultiplier: fieldOffset(Game.NCGrabbable, "throwingMultiplier"),
@@ -1398,6 +1409,7 @@ Il2Cpp.perform(() => {
         ballOwnedLocally: bind(Game.NCGrabbable, "NTIsOwnedLocally", 0),
         ballRequestOwnershipIfAllowed: bind(Game.NCGrabbable, "NTNVRequestOwnershipIfAllowed", 0),
         ballRequestTransformOwnership: bind(Game.NCGrabbable, "NetworkedTransformRequestOwnership", 0),
+        ballUnowned: bind(Game.NCGrabbable, "NTIsUnOwned", 0),
         ballSetVelocities: bind(Game.NCGrabbable, "SetRbVelocityAndAngularVelocity", 2),
         ballShotByLocalPlayer: bind(Game.NCGrabbable, "wasShotByLocalPlayer", 0),
         playerData: bind(Game.NCNetworkPlayer, "GetPlayerData", 0),
@@ -2438,8 +2450,7 @@ Il2Cpp.perform(() => {
                 }
             }
             recentReleases.set(keyOf(ball), now);
-            orbit.balls.delete(keyOf(ball));
-            ballStack.balls.delete(keyOf(ball));
+            leaveFormations(keyOf(ball));
             if (!modify || !aim || !unityAlive(rigidbody))
                 return result;
             try {
@@ -2452,13 +2463,7 @@ Il2Cpp.perform(() => {
         });
         // A ball you grab leaves the orbit or stack on the spot instead of at the next ownership check.
         hookMethod(Game.NCGrabbable, "OnGrab", 1, null, (original) => function (grabber) {
-            for (const formation of [orbit, ballStack]) {
-                const entry = formation.balls.get(keyOf(this));
-                if (entry) {
-                    restoreGravity(entry);
-                    formation.balls.delete(keyOf(this));
-                }
-            }
+            leaveFormations(keyOf(this));
             return original(this, grabber);
         });
     }
@@ -2466,9 +2471,10 @@ Il2Cpp.perform(() => {
     // ─────────────────────────────── Ball orbit & ball stack ───────────────────────────────
 
     // Both pull every ball nobody is holding into a formation around you with rigidbody velocity, so
-    // Normcore keeps interpolating them for everyone. Ownership is checked a few times a second and
-    // asked for at most once a second per ball; only balls we own are moved (moving anyone else's
-    // just gets snapped back), and held, guided or freshly thrown balls are never touched.
+    // Normcore keeps interpolating them for everyone. Ownership is checked locally a few times a
+    // second; requests come out of a shared budget with a growing wait per ball, and a ball stays ours
+    // once claimed. Only balls we own are moved (moving anyone else's just gets snapped back), and
+    // held, guided, freshly thrown or in-flight balls are never touched.
     const orbit = { balls: new Map(), nextScan: 0 };
     // Stack balls ignore each other's colliders (every ball that joined, in the stack or in flight),
     // so they don't knock each other away from the hoop. Restored when the stack is let go.
@@ -2513,21 +2519,69 @@ Il2Cpp.perform(() => {
         ballStack.colliders.clear();
     }
 
-    // Formation balls float without gravity while we move them; it comes back when they leave.
-    function restoreGravity(entry) {
-        if (!entry.gravityOff)
+    // Normcore drops ownership of a ball that falls asleep, which would mean claiming it all over
+    // again; formation balls keep it while they're ours. A local flag, nothing goes over the network.
+    function keepOwnershipAsleep(entry) {
+        if (entry.sleepFlag !== null || OFF.realtimeTransform.keepOwnershipAsleep < 0 || OFF.ball.realtimeTransform < 0)
             return;
-        entry.gravityOff = false;
         try {
-            if (unityAlive(entry.rigidbody))
-                U.rbSetUseGravity(entry.rigidbody, 1);
+            const transform = readPointerAt(entry.ball, OFF.ball.realtimeTransform);
+            if (!unityAlive(transform))
+                return;
+            entry.sleepFlag = readBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep);
+            writeBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep, true);
         }
         catch (_) { }
     }
 
+    // Formation balls float without gravity while we move them; gravity and the sleep setting come
+    // back when they leave.
+    function restoreBall(entry) {
+        if (entry.gravityOff) {
+            entry.gravityOff = false;
+            try {
+                if (unityAlive(entry.rigidbody))
+                    U.rbSetUseGravity(entry.rigidbody, 1);
+            }
+            catch (_) { }
+        }
+        if (entry.sleepFlag !== null) {
+            const flag = entry.sleepFlag;
+            entry.sleepFlag = null;
+            try {
+                const transform = readPointerAt(entry.ball, OFF.ball.realtimeTransform);
+                if (unityAlive(transform))
+                    writeBoolAt(transform, OFF.realtimeTransform.keepOwnershipAsleep, flag);
+            }
+            catch (_) { }
+        }
+    }
+
+    function leaveFormations(key) {
+        for (const formation of [orbit, ballStack]) {
+            const entry = formation.balls.get(key);
+            if (entry) {
+                restoreBall(entry);
+                formation.balls.delete(key);
+            }
+        }
+    }
+
+    const ownershipBudget = { tokens: ORBIT_OWNERSHIP_REQUESTS_PER_SECOND, time: 0 };
+
+    function takeOwnershipRequest(now) {
+        ownershipBudget.tokens = Math.min(ORBIT_OWNERSHIP_REQUESTS_PER_SECOND,
+            ownershipBudget.tokens + (now - ownershipBudget.time) * ORBIT_OWNERSHIP_REQUESTS_PER_SECOND);
+        ownershipBudget.time = now;
+        if (ownershipBudget.tokens < 1)
+            return false;
+        ownershipBudget.tokens -= 1;
+        return true;
+    }
+
     function releaseFormation(formation, stopMotion) {
         for (const entry of formation.balls.values()) {
-            restoreGravity(entry);
+            restoreBall(entry);
             if (!stopMotion || !entry.owned || entry.kinematic || !unityAlive(entry.rigidbody))
                 continue;
             try {
@@ -2569,7 +2623,7 @@ Il2Cpp.perform(() => {
         const chosenKeys = new Set(chosen.map((ball) => ball.key));
         for (const [key, entry] of formation.balls) {
             if (!chosenKeys.has(key)) {
-                restoreGravity(entry);
+                restoreBall(entry);
                 formation.balls.delete(key);
             }
         }
@@ -2585,15 +2639,17 @@ Il2Cpp.perform(() => {
                 owned: false,
                 kinematic: false,
                 gravityOff: false,
+                sleepFlag: null,
+                backoff: ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS,
                 nextCheck: now + Math.random() * ORBIT_OWNERSHIP_CHECK_SECONDS,
-                nextRequest: now + Math.random() * ORBIT_OWNERSHIP_RETRY_SECONDS,
+                nextRequest: now,
             });
         }
     }
 
-    // A dropped ball's view often stays with its last holder, and Normcore won't hand over the
-    // transform while the view belongs to someone else, so both are asked for (the game's own
-    // "if allowed" request, which only goes through when nobody holds the ball).
+    // Physics only needs the ball's RealtimeTransform. The game's "if allowed" request also asks for
+    // the view and clears it again right away (the view owner is whoever holds the ball), so it costs
+    // three messages; the transform request alone is one, and it comes out of the shared budget.
     function refreshFormationOwnership(key, entry, now) {
         entry.nextCheck = now + ORBIT_OWNERSHIP_CHECK_SECONDS;
         let held = true;
@@ -2610,17 +2666,31 @@ Il2Cpp.perform(() => {
         catch (_) {
             entry.owned = false;
         }
-        if (!entry.owned && now >= entry.nextRequest) {
-            entry.nextRequest = now + ORBIT_OWNERSHIP_RETRY_SECONDS;
-            try {
-                G.ballRequestOwnershipIfAllowed(entry.ball);
-            }
-            catch (_) { }
-            try {
-                G.ballRequestTransformOwnership(entry.ball);
-            }
-            catch (_) { }
+        if (entry.owned) {
+            entry.backoff = ORBIT_OWNERSHIP_BACKOFF_MIN_SECONDS;
+            keepOwnershipAsleep(entry);
+            return true;
         }
+        if (now < entry.nextRequest)
+            return true;
+        try {
+            if (!G.ballUnowned(entry.ball)) {
+                const velocity = U.rbVelocity(entry.rigidbody);
+                if (Math.hypot(velocity[0], velocity[1], velocity[2]) > ORBIT_CLAIM_MAX_SPEED)
+                    return true;
+            }
+        }
+        catch (_) {
+            return true;
+        }
+        if (!takeOwnershipRequest(now))
+            return true;
+        entry.nextRequest = now + entry.backoff;
+        entry.backoff = Math.min(entry.backoff * 2, ORBIT_OWNERSHIP_BACKOFF_MAX_SECONDS);
+        try {
+            G.ballRequestTransformOwnership(entry.ball);
+        }
+        catch (_) { }
         return true;
     }
 
@@ -2637,7 +2707,7 @@ Il2Cpp.perform(() => {
             if (!unityAlive(entry.ball) || !unityAlive(entry.rigidbody) || autoAim.guidedKeys.has(key) ||
                 (released !== undefined && now - released < ORBIT_RELEASE_GRACE_SECONDS) ||
                 (now >= entry.nextCheck && !refreshFormationOwnership(key, entry, now))) {
-                restoreGravity(entry);
+                restoreBall(entry);
                 formation.balls.delete(key);
                 continue;
             }
@@ -2667,7 +2737,7 @@ Il2Cpp.perform(() => {
                 U.rbSetVelocity(entry.rigidbody, velocity);
             }
             catch (_) {
-                restoreGravity(entry);
+                restoreBall(entry);
                 formation.balls.delete(key);
             }
         });
@@ -2765,7 +2835,7 @@ Il2Cpp.perform(() => {
                 continue;
             let launched = false;
             try {
-                restoreGravity(entry);
+                restoreBall(entry);
                 launched = launchAtHoop(entry.ball, entry.rigidbody, U.rbPosition(entry.rigidbody), null, now, { forced: true, hoop });
             }
             catch (_) {
