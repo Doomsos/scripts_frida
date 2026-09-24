@@ -140,7 +140,7 @@ Il2Cpp.perform(() => {
         { width: 32, height: 4.0 },
     ];
     const HOOP_HITBOX_DEFAULT = 4;
-    const OWNERSHIP_SPAM_REPEATS = 10;
+    const OWNERSHIP_SPAM_REPEATS = 2000;
     const STEAL_BALL_TRIGGER_THRESHOLD = 0.55;
     const STEAL_BALL_RAY_RADIUS = 0.35;
     const STEAL_BALL_RAY_RADIUS_PER_METER = 0.03;
