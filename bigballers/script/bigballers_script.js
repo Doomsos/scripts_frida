@@ -4970,6 +4970,38 @@ Il2Cpp.perform(() => {
         rename: libcFunction("rename", "int", ["pointer", "pointer"]),
     };
 
+    const ioDirectory = {
+        createDirectory: null,
+        exists: null,
+        getFiles: null,
+    };
+    try {
+        const dirClass = Il2Cpp.corlib.class("System.IO.Directory");
+        if (dirClass) {
+            const createMethod = findMethod(dirClass, "CreateDirectory", 1);
+            if (createMethod)
+                ioDirectory.createDirectory = (path) => createMethod.invoke(managed(path));
+            const existsMethod = findMethod(dirClass, "Exists", 1);
+            if (existsMethod)
+                ioDirectory.exists = (path) => !!existsMethod.invoke(managed(path));
+            const getFilesMethod = findMethod(dirClass, "GetFiles", 1);
+            if (getFilesMethod) {
+                ioDirectory.getFiles = (path) => {
+                    try {
+                        const arr = getFilesMethod.invoke(managed(path));
+                        if (!arr || toPointer(arr).isNull())
+                            return [];
+                        return arrayItems(arr).map((p) => readString(p)).filter(Boolean);
+                    }
+                    catch (_) {
+                        return [];
+                    }
+                };
+            }
+        }
+    }
+    catch (_) { }
+
     function gamePackageName() {
         try {
             // The process name, up to the NUL (or a ":service" suffix). Read as bytes: the text
@@ -4995,12 +5027,24 @@ Il2Cpp.perform(() => {
     }
 
     function makeDirectories(path) {
+        if (!path)
+            return;
+        try {
+            if (ioDirectory.createDirectory) {
+                ioDirectory.createDirectory(path);
+                return;
+            }
+        }
+        catch (_) { }
         if (!libc.mkdir)
             return;
         let current = "";
         for (const part of path.split("/").filter(Boolean)) {
             current += `/${part}`;
-            libc.mkdir(Memory.allocUtf8String(current), 0o771);
+            try {
+                libc.mkdir(Memory.allocUtf8String(current), 0o771);
+            }
+            catch (_) { }
         }
     }
 
@@ -5119,6 +5163,17 @@ Il2Cpp.perform(() => {
             `/storage/emulated/0/Android/data/${packageName}/files/${CONFIG_DIRECTORY}`,
             `/data/data/${packageName}/files/${CONFIG_DIRECTORY}`,
         ];
+
+        // Ensure all required menu directories exist immediately at boot to prevent access violations
+        for (const dir of configFile.directories) {
+            try {
+                makeDirectories(dir);
+                makeDirectories(`${dir}/${SOUNDS_DIRECTORY}`);
+                makeDirectories(`${dir}/${SOUND_CACHE_DIRECTORY}`);
+            }
+            catch (_) { }
+        }
+
         configFile.directories.some(openLogFile);
         for (const directory of configFile.directories) {
             const path = `${directory}/${CONFIG_FILE}`;
@@ -5151,6 +5206,15 @@ Il2Cpp.perform(() => {
                 catch (_) { }
             }
             return;
+        }
+
+        // If no config file was present, set default path and save current defaults immediately
+        if (!configFile.path && configFile.directories.length > 0) {
+            configFile.path = `${configFile.directories[0]}/${CONFIG_FILE}`;
+            try {
+                saveConfig();
+            }
+            catch (_) { }
         }
     }
 
@@ -5283,29 +5347,50 @@ Il2Cpp.perform(() => {
     const overdoseDirectory = () => configFile.path ? configFile.path.slice(0, configFile.path.lastIndexOf("/")) : (configFile.directories[0] ?? "");
     const soundsDirectory = () => `${overdoseDirectory()}/${SOUNDS_DIRECTORY}`;
 
-    // bionic's struct dirent: d_ino (8), d_off (8), d_reclen (2), d_type (1), d_name.
+    // Directory listing with managed fallback to prevent access violations
     function listDirectory(path) {
         const names = [];
-        if (!libcDirectory.open || !libcDirectory.read || !libcDirectory.close)
-            return names;
-        const directory = libcDirectory.open(Memory.allocUtf8String(path));
-        if (directory.isNull())
-            return names;
         try {
-            for (let entry = libcDirectory.read(directory); !entry.isNull(); entry = libcDirectory.read(directory)) {
-                if (entry.add(18).readU8() !== 4)
-                    names.push(entry.add(19).readUtf8String());
+            if (ioDirectory.getFiles) {
+                const fullPaths = ioDirectory.getFiles(path);
+                if (fullPaths && fullPaths.length > 0) {
+                    for (const fp of fullPaths) {
+                        const idx = Math.max(fp.lastIndexOf("/"), fp.lastIndexOf("\\"));
+                        names.push(idx >= 0 ? fp.slice(idx + 1) : fp);
+                    }
+                    return names;
+                }
             }
         }
-        finally {
-            libcDirectory.close(directory);
+        catch (_) { }
+
+        if (!libcDirectory.open || !libcDirectory.read || !libcDirectory.close)
+            return names;
+        try {
+            const directory = libcDirectory.open(Memory.allocUtf8String(path));
+            if (directory.isNull())
+                return names;
+            try {
+                for (let entry = libcDirectory.read(directory); !entry.isNull(); entry = libcDirectory.read(directory)) {
+                    try {
+                        if (entry.add(18).readU8() !== 4)
+                            names.push(entry.add(19).readUtf8String());
+                    }
+                    catch (_) { }
+                }
+            }
+            finally {
+                libcDirectory.close(directory);
+            }
         }
+        catch (_) { }
         return names;
     }
 
     function refreshSounds() {
         const directory = soundsDirectory();
         makeDirectories(directory);
+        makeDirectories(`${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`);
         soundboard.sounds = listDirectory(directory)
             .filter((name) => /\.wav$/i.test(name))
             .sort((a, b) => a.localeCompare(b))
