@@ -573,7 +573,10 @@ Il2Cpp.perform(() => {
                 items.push(base.add(index * Process.pointerSize).readPointer());
         }
         finally {
-            handle.free();
+            try {
+                handle.free();
+            }
+            catch (_) { }
         }
         return items;
     }
@@ -1026,19 +1029,17 @@ Il2Cpp.perform(() => {
 
     function newValueArray(klass, count, stride, write) {
         const array = Il2Cpp.array(klass, count);
-        const handle = pinObject(array);
         let cursor = array.handle.add(arrayHeaderSize);
         for (let index = 0; index < count; index++) {
             write(cursor, index);
             cursor = cursor.add(stride);
         }
-        return { pointer: array.handle, handle };
+        return { pointer: array.handle };
     }
 
     function buildMesh(vertices, triangles) {
         const mesh = Unity.Mesh.alloc().handle;
         const handle = pinObject(mesh);
-        const temporaries = [];
         try {
             U.newMesh(mesh);
             const vertexArray = newValueArray(Unity.Vector3, vertices.length, 12, (cursor, index) => {
@@ -1046,7 +1047,6 @@ Il2Cpp.perform(() => {
                 cursor.add(4).writeFloat(vertices[index][1]);
                 cursor.add(8).writeFloat(vertices[index][2]);
             });
-            temporaries.push(vertexArray.handle);
             U.meshSetVertices(mesh, vertexArray.pointer);
             // White vertex colors: vertex-colored fallback shaders multiply by them.
             const colorArray = newValueArray(Unity.Color, vertices.length, 16, (cursor) => {
@@ -1055,12 +1055,10 @@ Il2Cpp.perform(() => {
                 cursor.add(8).writeFloat(1);
                 cursor.add(12).writeFloat(1);
             });
-            temporaries.push(colorArray.handle);
             U.meshSetColors(mesh, colorArray.pointer);
             const triangleArray = newValueArray(Unity.Int32, triangles.length, 4, (cursor, index) => {
                 cursor.writeS32(triangles[index]);
             });
-            temporaries.push(triangleArray.handle);
             U.meshSetTriangles(mesh, triangleArray.pointer);
             U.meshRecalculateBounds(mesh);
             U.meshRecalculateNormals(mesh);
@@ -1070,12 +1068,11 @@ Il2Cpp.perform(() => {
             catch (_) { }
         }
         catch (error) {
-            handle.free();
+            try {
+                handle.free();
+            }
+            catch (_) { }
             throw error;
-        }
-        finally {
-            for (const temporary of temporaries)
-                temporary.free();
         }
         return { pointer: mesh, handle };
     }
@@ -1201,8 +1198,12 @@ Il2Cpp.perform(() => {
             logOnce("font", "no UI font found; menu text will be blank");
             return NULL;
         }
-        if (fontHandle)
-            fontHandle.free();
+        if (fontHandle) {
+            try {
+                fontHandle.free();
+            }
+            catch (_) { }
+        }
         fontHandle = pinObject(fontPointer);
         return fontPointer;
     }
@@ -2907,8 +2908,12 @@ Il2Cpp.perform(() => {
         };
         const release = () => {
             destroyObject(material);
-            if (handle)
-                handle.free();
+            if (handle) {
+                try {
+                    handle.free();
+                }
+                catch (_) { }
+            }
             material = NULL;
             handle = null;
         };
