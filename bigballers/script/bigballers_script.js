@@ -6015,7 +6015,7 @@ Il2Cpp.perform(() => {
                     frames += mono.length;
                     truncated = frames >= rate * SOUND_MAX_SECONDS;
                 }
-                media.releaseOutput(codec, output, false);
+                media.releaseOutput(codec, output, 0);
                 if (truncated || (flags & MEDIA_END_OF_STREAM))
                     break;
             }
