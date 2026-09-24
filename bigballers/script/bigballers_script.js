@@ -511,7 +511,7 @@ Il2Cpp.perform(() => {
             return cached.pointer;
         const string = Il2Cpp.string(value);
         if (managedStrings.size < 4096) {
-            managedStrings.set(value, { pointer: string.handle, handle: string.object.ref(false) });
+            managedStrings.set(value, { pointer: string.handle, handle: string.object.ref(true) });
         }
         return string.handle;
     }
@@ -539,7 +539,7 @@ Il2Cpp.perform(() => {
     function keep(scope, value) {
         const pointer = toPointer(value);
         if (!pointer.isNull())
-            scope.push(new Il2Cpp.Object(pointer).ref(false));
+            scope.push(new Il2Cpp.Object(pointer).ref(true));
         return pointer;
     }
 
@@ -1214,8 +1214,17 @@ Il2Cpp.perform(() => {
         const text = keep(scope, U.addComponent(gameObject, typeOf(Unity.Text)));
         const transform = keep(scope, U.gameObjectTransform(gameObject));
         U.setParent(transform, parentTransform, 0);
-        U.textFont(text, menuFont());
-        U.textSet(text, managed(content));
+        const font = menuFont();
+        if (unityAlive(font)) {
+            try {
+                U.textFont(text, font);
+            }
+            catch (_) { }
+        }
+        try {
+            U.textSet(text, managed(content));
+        }
+        catch (_) { }
         U.textFontSize(text, 1);
         U.textFontStyle(text, 0);
         U.textAlignment(text, 4);
@@ -3445,7 +3454,7 @@ Il2Cpp.perform(() => {
 
     function newPropertyBlock() {
         const block = Unity.MaterialPropertyBlock.alloc().handle;
-        const handle = new Il2Cpp.Object(block).ref(false);
+        const handle = new Il2Cpp.Object(block).ref(true);
         U.newPropertyBlock(block);
         return { pointer: block, handle };
     }
@@ -6013,22 +6022,39 @@ Il2Cpp.perform(() => {
     }
 
     function placeMenuRoot() {
-        U.setPositionAndRotation(menu.rootTransform, U.position(menu.hand), quatMul(U.rotation(menu.hand), MENU_TILT_ROTATION));
+        if (!unityAlive(menu.hand) || !unityAlive(menu.rootTransform))
+            return;
+        try {
+            U.setPositionAndRotation(menu.rootTransform, U.position(menu.hand), quatMul(U.rotation(menu.hand), MENU_TILT_ROTATION));
+        }
+        catch (_) { }
     }
 
     // World size follows the player-size preset so the menu stays proportional to your hands.
     function refreshMenuScale() {
+        if (!unityAlive(menu.rootTransform))
+            return;
         const size = MENU_SIZE * scalePreset().multiplier;
         if (!menu.parented) {
-            U.setLocalScale(menu.rootTransform, [size, size, size]);
+            try {
+                U.setLocalScale(menu.rootTransform, [size, size, size]);
+            }
+            catch (_) { }
             return;
         }
-        const lossy = U.lossyScale(menu.hand);
-        const handScale = (lossy[0] + lossy[1] + lossy[2]) / 3;
-        if (handScale > 0.0001) {
-            const local = size / handScale;
-            U.setLocalScale(menu.rootTransform, [local, local, local]);
+        try {
+            if (!unityAlive(menu.hand))
+                return;
+            const lossy = U.lossyScale(menu.hand);
+            if (lossy) {
+                const handScale = (lossy[0] + lossy[1] + lossy[2]) / 3;
+                if (handScale > 0.0001) {
+                    const local = size / handScale;
+                    U.setLocalScale(menu.rootTransform, [local, local, local]);
+                }
+            }
         }
+        catch (_) { }
     }
 
     function buildMenu() {
@@ -6203,22 +6229,32 @@ Il2Cpp.perform(() => {
         sameObject(menu.hand, refs.leftHand) && unityAlive(menu.hand);
 
     function openMenu(now) {
-        if (!menuAlive()) {
-            buildMenu();
+        try {
+            if (!menuAlive()) {
+                buildMenu();
+            }
+            else {
+                renderRows();
+                if (unityAlive(menu.root))
+                    U.setActive(menu.root, 1);
+            }
+            refreshMenuScale();
+            ensurePointer();
+            if (unityAlive(menu.pointer))
+                U.setActive(menu.pointer, 1);
+            menu.visible = true;
+            menu.shownAt = now;
+            menu.lastHit = null;
+            menu.nextCameraFix = now + CAMERA_FIX_SECONDS;
+            fixCameraCullingMasks(false);
         }
-        else {
-            renderRows();
-            U.setActive(menu.root, 1);
+        catch (err) {
+            log(`openMenu failed: ${describeError(err)}`);
+            try {
+                destroyMenu();
+            }
+            catch (_) { }
         }
-        refreshMenuScale();
-        ensurePointer();
-        if (unityAlive(menu.pointer))
-            U.setActive(menu.pointer, 1);
-        menu.visible = true;
-        menu.shownAt = now;
-        menu.lastHit = null;
-        menu.nextCameraFix = now + CAMERA_FIX_SECONDS;
-        fixCameraCullingMasks(false);
     }
 
     function closeMenu() {
