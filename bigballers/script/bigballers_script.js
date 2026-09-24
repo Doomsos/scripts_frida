@@ -1233,10 +1233,24 @@ Il2Cpp.perform(() => {
         CompetitiveGameSync: findClass(images.game, "CompetitiveGameSync"),
         GameEventService: findClass(images.game, "DL.PlayerService.GameEventService"),
         HoopCenterPoint: findClass(images.extra, "HoopCenterPoint"),
+        AudioSync: findClass(images.game, "AudioSync") ?? findClass(images.extra, "AudioSync"),
+        SoundEffectsManagerSO: findClass(images.game, "SoundEffectsManagerSO") ?? findClass(images.extra, "SoundEffectsManagerSO"),
         BasketballEventListener: findClass(images.extra, "_BigBallers.Scripts.Normcore.GameHandlers.GamePlayCustomScripts.BasketballEventListener"),
     };
 
+    Game.SoundEffect = (() => {
+        try {
+            return Game.SoundEffectsManagerSO ? Game.SoundEffectsManagerSO.nestedClasses.find((klass) => klass.name === "SoundEffect") ?? null : null;
+        }
+        catch (_) {
+            return null;
+        }
+    })();
+
     const OFF = {
+        audioSync: {
+            pool: fieldOffset(Game.AudioSync, "soundEventTriggersSynced"),
+        },
         hand: {
             left: fieldOffset(Game.HandManager, "HandL"),
             right: fieldOffset(Game.HandManager, "HandR"),
@@ -1317,9 +1331,13 @@ Il2Cpp.perform(() => {
         iapManager: staticReader(Game.DLIAPManager, "Instance"),
         uiManager: staticReader(Game.UIManager, "Instance"),
         progression: staticReader(Game.BBProgressionManager, "Instance"),
+        audioSync: staticReader(Game.AudioSync, "I"),
     };
 
     const G = {
+        playGameSound: Game.SoundEffect
+            ? bind(Game.AudioSync, "PlayOneShot", 2, [Unity.Vector3, Game.SoundEffect])
+            : bind(null, "PlayOneShot", 2),
         mainCameraTransform: bind(Game.DLGameController, "get_mainCameraTransform", 0),
         isGameBallForHoop: bind(Game.DLGameController, "isGameBallForHoop", 1),
         inputBridgeInstance: bind(Game.InputBridge, "get_Instance", 0),
@@ -6144,6 +6162,7 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         if (!soundboard.listed)
             refreshSounds();
         const entries = [
+            categoryEntry("open-game-sounds", "Game Sounds", "Game Sounds"),
             actionEntry("sounds-reload", "Reload Sounds", reloadSounds),
             actionEntry("sounds-stop", "Stop All Sounds", () => stopSounds()),
             incrementEntry("sound-volume", "Sound Volume", () => `${settings.soundBoost}x`, stepSoundBoost),
@@ -6161,8 +6180,99 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return entries;
     }
 
+    const GAME_SOUND_MAX_PER_PRESS = 8;
+    const gameSounds = { list: null };
+
+    const spacedName = (name) => name.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+
+    function gameSoundList() {
+        if (gameSounds.list)
+            return gameSounds.list;
+        const list = [];
+        try {
+            for (const field of Game.SoundEffect.fields) {
+                if (!field.isStatic || field.name === "value__")
+                    continue;
+                let value = list.length;
+                try {
+                    const read = Number(Il2Cpp.read(field.value.handle, Game.SoundEffect.baseType));
+                    if (Number.isInteger(read))
+                        value = read;
+                }
+                catch (_) { }
+                list.push({ name: field.name, value, label: spacedName(field.name) });
+            }
+        }
+        catch (error) {
+            log(`game sounds unavailable: ${describeError(error)}`);
+        }
+        gameSounds.list = list;
+        if (list.length > 0)
+            log(`loaded ${list.length} game sounds`);
+        return list;
+    }
+
+    function gameSoundPositions(limit) {
+        const positions = [];
+        const own = headPosition();
+        if (own)
+            positions.push(own);
+        for (const player of visualPlayers()) {
+            if (positions.length >= limit)
+                break;
+            try {
+                positions.push(U.position(player.head));
+            }
+            catch (_) { }
+        }
+        return positions;
+    }
+
+    function gameSoundPoolSize(audioSync) {
+        try {
+            if (OFF.audioSync.pool >= 0) {
+                const pool = readPointerAt(audioSync, OFF.audioSync.pool);
+                if (!pool.isNull())
+                    return Math.max(1, readPointerAt(pool, 0x18).toInt32());
+            }
+        }
+        catch (_) { }
+        return 4;
+    }
+
+    function playGameSound(sound) {
+        const audioSync = statics.audioSync();
+        if (!unityAlive(audioSync) || !G.playGameSound.available) {
+            log("game sounds aren't available here");
+            return;
+        }
+        const positions = gameSoundPositions(Math.min(GAME_SOUND_MAX_PER_PRESS, gameSoundPoolSize(audioSync)));
+        let played = 0;
+        for (const position of positions) {
+            try {
+                G.playGameSound(audioSync, position, sound.value);
+                played++;
+            }
+            catch (error) {
+                logThrottled("game-sound", 5, `couldn't play ${sound.label}: ${describeError(error)}`);
+            }
+        }
+        if (played > 0)
+            log(`played ${sound.label} for everyone (${played} player${played === 1 ? "" : "s"})`);
+    }
+
+    function gameSoundEntries() {
+        const entries = [];
+        const list = gameSoundList();
+        if (list.length === 0)
+            entries.push(actionEntry("game-sounds-none", "No Game Sounds", () => log("the game's sound list couldn't be read")));
+        for (const sound of list)
+            entries.push(actionEntry(`game-sound-${sound.name}`, sound.label, () => playGameSound(sound)));
+        return entries;
+    }
+
     const HOME = "Home";
-    const CATEGORY_PARENT = { Levels: "Spawning", Titles: "Spawning" };
+    const CATEGORY_PARENT = { Levels: "Spawning", Titles: "Spawning", "Game Sounds": "Sounds" };
     const RAIL_NORMAL = [Math.cos(LAYOUT.rail.tilt * DEG), Math.sin(LAYOUT.rail.tilt * DEG), 0];
 
     const menu = {
@@ -6291,6 +6401,8 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
                 ];
             case "Levels":
                 return LEVEL_INCREASE_CHOICES.map((amount) => actionEntry(`level-${amount}`, `Increase Level By ${amount}`, () => increaseLevelBy(amount)));
+            case "Game Sounds":
+                return gameSoundEntries();
             case "Sounds":
                 return soundEntries();
             case "Titles":
