@@ -219,6 +219,8 @@ Il2Cpp.perform(() => {
     // Converting a sound runs on the game thread, so it's done a few milliseconds per frame (the
     // loops yield every SOUND_PREP_CHUNK samples) instead of freezing the game for a second.
     const SOUND_PREP_SLICE_MS = 3;
+    // While a pressed sound is waiting to play, it gets a bigger slice.
+    const SOUND_PREP_PRESSED_SLICE_MS = 8;
     const SOUND_PREP_CHUNK = 4096;
     const SOUND_DECODE_TIMEOUT_MS = 60000;
     // Soundboard loudness: sounds are brought to full scale, then pushed this much louder with a
@@ -5720,6 +5722,7 @@ Il2Cpp.perform(() => {
         clipScope: [],
         vivox: undefined,
         media: undefined,
+        kernels: undefined,
         jobs: [],
     };
 
@@ -5851,6 +5854,16 @@ Il2Cpp.perform(() => {
             throw new Error(`unsupported WAV encoding ${format.encoding}/${format.bits}-bit (convert it with push_sounds.py)`);
         const frameBytes = bytes * format.channels;
         const frames = Math.min(Math.floor(dataLength / frameBytes), format.rate * SOUND_MAX_SECONDS);
+        const truncated = Math.floor(dataLength / frameBytes) > frames;
+        const kernels = soundKernels();
+        const nativeMix = kernels && { "1:16": kernels.mixS16, "3:32": kernels.mixF32 }[`${format.encoding}:${format.bits}`];
+        if (nativeMix && frames > 0) {
+            const pcm = Memory.alloc(frames * frameBytes);
+            pcm.writeByteArray(buffer.slice(dataOffset, dataOffset + frames * frameBytes));
+            const output = Memory.alloc(frames * 4);
+            nativeMix(pcm, frames, format.channels, output);
+            return { samples: floatsFrom(output, frames), rate: format.rate, truncated };
+        }
         const mono = new Float32Array(frames);
         for (let frame = 0; frame < frames; frame++) {
             let sum = 0;
@@ -5861,7 +5874,118 @@ Il2Cpp.perform(() => {
             if ((frame & (SOUND_PREP_CHUNK - 1)) === 0)
                 yield;
         }
-        return { samples: mono, rate: format.rate, truncated: Math.floor(dataLength / frameBytes) > frames };
+        return { samples: mono, rate: format.rate, truncated };
+    }
+
+    // ─── Native sample kernels ───
+
+    // The per-sample loops (mixing to mono, resampling, the loudness curve) are thousands of times
+    // faster compiled than in the script engine. Built once with Frida's CModule; if that isn't
+    // available, the sliced JS loops do the same work.
+    const SOUND_KERNELS_SOURCE = `
+extern float tanhf (float);
+
+void mix_s16 (const short * in, int frames, int channels, float * out)
+{
+  int f, c;
+  float scale = 1.0f / (32768.0f * channels);
+  for (f = 0; f != frames; f++)
+  {
+    float sum = 0.0f;
+    for (c = 0; c != channels; c++)
+      sum += in[f * channels + c];
+    out[f] = sum * scale;
+  }
+}
+
+void mix_f32 (const float * in, int frames, int channels, float * out)
+{
+  int f, c;
+  for (f = 0; f != frames; f++)
+  {
+    float sum = 0.0f;
+    for (c = 0; c != channels; c++)
+      sum += in[f * channels + c];
+    out[f] = sum / channels;
+  }
+}
+
+void resample (const float * in, int in_length, float * out, int out_length, double step)
+{
+  int i, base, next, last = in_length - 1;
+  double position;
+  for (i = 0; i != out_length; i++)
+  {
+    position = i * step;
+    base = (int) position;
+    if (base > last)
+      base = last;
+    next = base + 1;
+    if (next > last)
+      next = last;
+    out[i] = in[base] + (in[next] - in[base]) * (float) (position - base);
+  }
+}
+
+float peak (const float * in, int n)
+{
+  int i;
+  float p = 0.0f, v;
+  for (i = 0; i != n; i++)
+  {
+    v = in[i] < 0.0f ? -in[i] : in[i];
+    if (v > p)
+      p = v;
+  }
+  return p;
+}
+
+void loud_s16 (const float * in, int n, float gain, float scale, short * out)
+{
+  int i;
+  float v;
+  for (i = 0; i != n; i++)
+  {
+    v = gain > 0.0f ? tanhf (in[i] * gain) * scale : in[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    out[i] = (short) (v * 32767.0f + (v >= 0.0f ? 0.5f : -0.5f));
+  }
+}
+`;
+
+    function soundKernels() {
+        if (soundboard.kernels !== undefined)
+            return soundboard.kernels;
+        soundboard.kernels = null;
+        try {
+            const tanhf = Module.findGlobalExportByName("tanhf");
+            if (tanhf === null)
+                throw new Error("tanhf isn't exported");
+            const module = new CModule(SOUND_KERNELS_SOURCE, { tanhf });
+            soundboard.kernels = {
+                module,
+                mixS16: new NativeFunction(module.mix_s16, "void", ["pointer", "int", "int", "pointer"]),
+                mixF32: new NativeFunction(module.mix_f32, "void", ["pointer", "int", "int", "pointer"]),
+                resample: new NativeFunction(module.resample, "void", ["pointer", "int", "pointer", "int", "double"]),
+                peak: new NativeFunction(module.peak, "float", ["pointer", "int"]),
+                loudS16: new NativeFunction(module.loud_s16, "void", ["pointer", "int", "float", "float", "pointer"]),
+            };
+        }
+        catch (error) {
+            log(`sounds will convert more slowly: native kernels unavailable (${error.message})`);
+        }
+        return soundboard.kernels;
+    }
+
+    const floatsFrom = (pointer, count) => new Float32Array(pointer.readByteArray(count * 4));
+
+    function nativeFloats(samples) {
+        const pointer = Memory.alloc(Math.max(4, samples.length * 4));
+        pointer.writeByteArray(samples.buffer.byteLength === samples.length * 4 ? samples.buffer : samples.slice().buffer);
+        return pointer;
     }
 
     // ─── Other formats: Android's decoder ───
@@ -5979,6 +6103,8 @@ Il2Cpp.perform(() => {
             let frames = 0;
             let truncated = false;
             let inputDone = false;
+            let scratch = null;
+            let scratchFrames = 0;
             const giveUpAt = Date.now() + SOUND_DECODE_TIMEOUT_MS;
             for (;;) {
                 if (Date.now() > giveUpAt)
@@ -6016,16 +6142,30 @@ Il2Cpp.perform(() => {
                 const bytes = info.add(4).readS32();
                 const flags = info.add(16).readU32();
                 if (bytes > 0) {
-                    const raw = media.outputBuffer(codec, output, size).add(offset).readByteArray(bytes);
-                    const values = encoding === MEDIA_PCM_FLOAT ? new Float32Array(raw) : new Int16Array(raw);
-                    const scale = encoding === MEDIA_PCM_FLOAT ? 1 : 1 / 32768;
-                    const count = Math.min(Math.floor(values.length / channels), rate * SOUND_MAX_SECONDS - frames);
-                    const mono = new Float32Array(Math.max(0, count));
-                    for (let frame = 0; frame < mono.length; frame++) {
-                        let sum = 0;
-                        for (let channel = 0; channel < channels; channel++)
-                            sum += values[frame * channels + channel];
-                        mono[frame] = sum * scale / channels;
+                    const source = media.outputBuffer(codec, output, size).add(offset);
+                    const sampleBytes = encoding === MEDIA_PCM_FLOAT ? 4 : 2;
+                    const count = Math.max(0, Math.min(Math.floor(bytes / (sampleBytes * channels)), rate * SOUND_MAX_SECONDS - frames));
+                    const kernels = soundKernels();
+                    let mono;
+                    if (kernels) {
+                        if (!scratch || scratchFrames < count) {
+                            scratchFrames = Math.max(count, 8192);
+                            scratch = Memory.alloc(scratchFrames * 4);
+                        }
+                        (encoding === MEDIA_PCM_FLOAT ? kernels.mixF32 : kernels.mixS16)(source, count, channels, scratch);
+                        mono = floatsFrom(scratch, count);
+                    }
+                    else {
+                        const raw = source.readByteArray(count * channels * sampleBytes);
+                        const values = encoding === MEDIA_PCM_FLOAT ? new Float32Array(raw) : new Int16Array(raw);
+                        const scale = encoding === MEDIA_PCM_FLOAT ? 1 : 1 / 32768;
+                        mono = new Float32Array(count);
+                        for (let frame = 0; frame < count; frame++) {
+                            let sum = 0;
+                            for (let channel = 0; channel < channels; channel++)
+                                sum += values[frame * channels + channel];
+                            mono[frame] = sum * scale / channels;
+                        }
                     }
                     chunks.push(mono);
                     yield;
@@ -6079,6 +6219,12 @@ Il2Cpp.perform(() => {
         if (fromRate === toRate)
             return samples;
         const length = Math.max(1, Math.round(samples.length * toRate / fromRate));
+        const kernels = soundKernels();
+        if (kernels && samples.length > 0) {
+            const output = Memory.alloc(length * 4);
+            kernels.resample(nativeFloats(samples), samples.length, output, length, fromRate / toRate);
+            return floatsFrom(output, length);
+        }
         const output = new Float32Array(length);
         const step = fromRate / toRate;
         const last = samples.length - 1;
@@ -6091,6 +6237,44 @@ Il2Cpp.perform(() => {
                 yield;
         }
         return output;
+    }
+
+    function wavHeader(sampleCount, rate) {
+        const buffer = new ArrayBuffer(44);
+        const view = new DataView(buffer);
+        const writeTag = (offset, text) => {
+            for (let index = 0; index < 4; index++)
+                view.setUint8(offset + index, text.charCodeAt(index));
+        };
+        writeTag(0, "RIFF");
+        view.setUint32(4, 36 + sampleCount * 2, true);
+        writeTag(8, "WAVE");
+        writeTag(12, "fmt ");
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, rate, true);
+        view.setUint32(28, rate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeTag(36, "data");
+        view.setUint32(40, sampleCount * 2, true);
+        return buffer;
+    }
+
+    // The boosted 16-bit voice WAV (see makeLoudSteps), made in one native pass when it can be.
+    function* voiceWavSteps(samples, boost) {
+        const kernels = soundKernels();
+        if (kernels && samples.length > 0) {
+            const floats = nativeFloats(samples);
+            const peak = kernels.peak(floats, samples.length);
+            const file = Memory.alloc(44 + samples.length * 2);
+            file.writeByteArray(wavHeader(samples.length, VOICE_SAMPLE_RATE));
+            const gain = peak < 1e-4 ? 0 : boost / peak;
+            kernels.loudS16(floats, samples.length, gain, gain > 0 ? 0.98 / Math.tanh(boost) : 1, file.add(44));
+            return file.readByteArray(44 + samples.length * 2);
+        }
+        return yield* encodeWavSteps(yield* makeLoudSteps(samples, boost), VOICE_SAMPLE_RATE);
     }
 
     function* encodeWavSteps(samples, rate) {
@@ -6147,15 +6331,77 @@ Il2Cpp.perform(() => {
 
     // Converted once per session: a boosted 48 kHz mono WAV for Vivox, and an AudioClip at the
     // file's own level for playing it on your headset (the Sound Volume boost is only for others).
+    // Converted sounds stay in .soundcache between sessions: the 48 kHz mono samples (.f32, for your
+    // headset and for re-boosting) and the boosted voice WAV. index.json remembers which source file
+    // (by size) and which Sound Volume each was made from, so a changed file is converted again and
+    // a volume change only redoes the quick boost step.
+    const SOUND_CACHE_INDEX = "index.json";
+
+    function readSoundCacheIndex(cacheDirectory) {
+        try {
+            const index = JSON.parse(File.readAllText(`${cacheDirectory}/${SOUND_CACHE_INDEX}`));
+            return index && typeof index === "object" ? index : {};
+        }
+        catch (_) {
+            return {};
+        }
+    }
+
+    function writeSoundCacheIndex(cacheDirectory, index) {
+        try {
+            File.writeAllText(`${cacheDirectory}/${SOUND_CACHE_INDEX}`, JSON.stringify(index));
+        }
+        catch (_) { }
+    }
+
+    function fileSize(filePath) {
+        try {
+            return File.readAllBytes(filePath).byteLength;
+        }
+        catch (_) {
+            return -1;
+        }
+    }
+
     function* prepareSoundSteps(sound) {
-        const decoded = yield* decodeSoundSteps(sound);
-        const samples = yield* resampleSteps(decoded.samples, decoded.rate, VOICE_SAMPLE_RATE);
-        const voiceWav = yield* encodeWavSteps(yield* makeLoudSteps(samples, settings.soundBoost), VOICE_SAMPLE_RATE);
         const cacheDirectory = `${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`;
         makeDirectories(cacheDirectory);
         // horn.wav -> horn.wav, horn.mp3 -> horn.mp3.wav, so two formats of one name don't collide.
         const voicePath = `${cacheDirectory}/${sound.name.replace(/\.wav$/i, "")}.wav`;
-        File.writeAllBytes(voicePath, voiceWav);
+        const samplesPath = `${cacheDirectory}/${sound.name}.f32`;
+        const index = readSoundCacheIndex(cacheDirectory);
+        const size = fileSize(sound.path);
+        const cached = index[sound.name];
+        let samples = null;
+        let decoded = { truncated: false };
+        if (cached && cached.size === size && size >= 0) {
+            try {
+                samples = new Float32Array(File.readAllBytes(samplesPath));
+                decoded = { truncated: !!cached.truncated };
+            }
+            catch (_) {
+                samples = null;
+            }
+        }
+        if (!samples || samples.length === 0) {
+            decoded = yield* decodeSoundSteps(sound);
+            samples = yield* resampleSteps(decoded.samples, decoded.rate, VOICE_SAMPLE_RATE);
+            try {
+                File.writeAllBytes(samplesPath, samples.buffer.byteLength === samples.length * 4 ? samples.buffer : samples.slice().buffer);
+            }
+            catch (_) { }
+        }
+        let voiceReady = false;
+        if (cached && cached.size === size && cached.boost === settings.soundBoost) {
+            try {
+                voiceReady = File.readAllBytes(voicePath).byteLength === 44 + samples.length * 2;
+            }
+            catch (_) { }
+        }
+        if (!voiceReady)
+            File.writeAllBytes(voicePath, yield* voiceWavSteps(samples, settings.soundBoost));
+        index[sound.name] = { size, boost: settings.soundBoost, truncated: !!decoded.truncated };
+        writeSoundCacheIndex(cacheDirectory, index);
         let clip = NULL;
         const scope = [];
         try {
@@ -6280,7 +6526,7 @@ Il2Cpp.perform(() => {
     function updateSoundJobs() {
         if (soundboard.jobs.length === 0)
             return;
-        const deadline = Date.now() + SOUND_PREP_SLICE_MS;
+        const deadline = Date.now() + (soundboard.jobs[0].play ? SOUND_PREP_PRESSED_SLICE_MS : SOUND_PREP_SLICE_MS);
         while (soundboard.jobs.length > 0 && Date.now() < deadline) {
             const job = soundboard.jobs[0];
             let step;
