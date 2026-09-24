@@ -77,10 +77,12 @@ Il2Cpp.perform(() => {
     const AUTO_AIM_METERS_PER_SECOND = 24.0;
     const AUTO_AIM_GATE_HEIGHT = 0.55;
     const AUTO_AIM_GATE_DROP_SPEED = 3.25;
-    // Swish shots come down into the hoop at least this steeply, so the arc scores on its own even
-    // if the in-flight guidance never gets to run (server lag, ownership still on its way).
-    const AUTO_AIM_MIN_ENTRY_DEGREES = 47;
-    const AUTO_AIM_ENTRY_HEIGHT = 0.08;
+    // Swish shots come down through the center of the rim at least this steeply, so the arc scores on
+    // its own even if the in-flight guidance never gets to run (server lag, ownership still on its
+    // way). At 55 degrees the rim leaves ~14 cm of room either way; aiming above the rim plane would
+    // carry the ball past the center toward the back rim.
+    const AUTO_AIM_MIN_ENTRY_DEGREES = 55;
+    const AUTO_AIM_ENTRY_HEIGHT = 0.0;
     // While a shot is ours it's held to the planned arc: anything that knocks it off (the game's own
     // throw velocity landing late, a laggy correction) gets steered back.
     const AUTO_AIM_PATH_TOLERANCE = 0.25;
