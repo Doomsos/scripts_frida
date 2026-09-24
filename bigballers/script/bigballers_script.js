@@ -1286,7 +1286,7 @@ Il2Cpp.perform(() => {
         NCNetworkPlayer: requireClass(images.game, "NCNetworkPlayer"),
         NCNetworkPlayerData: findClass(images.game, "NCNetworkPlayerData"),
         NCNetworkPlayerDataController: findClass(images.game, "NCNetworkPlayerDataController"),
-        PlayerDataController: findClass(images.game, "PlayerDataController") ?? findClass(images.game, "NCNetworkPlayerDataController"),
+        DLDisplayName: findClass(images.game, "DLDisplayName"),
         PlayerSync: findClass(images.game, "PlayerSync"),
         PlayerModel: findClass(images.game, "PlayerModel") ?? findClass(images.extra, "PlayerModel"),
         IAPItemSO: requireClass(images.game, "IAPItemSO"),
@@ -1306,6 +1306,9 @@ Il2Cpp.perform(() => {
     };
 
     const OFF = {
+        playerSync: {
+            publishedRoomId: fieldOffset(Game.PlayerSync, "_publishedRoomId"),
+        },
         hand: {
             left: fieldOffset(Game.HandManager, "HandL"),
             right: fieldOffset(Game.HandManager, "HandR"),
@@ -1386,7 +1389,6 @@ Il2Cpp.perform(() => {
         iapManager: staticReader(Game.DLIAPManager, "Instance"),
         uiManager: staticReader(Game.UIManager, "Instance"),
         progression: staticReader(Game.BBProgressionManager, "Instance"),
-        playerDataController: staticReader(Game.PlayerDataController, "LocalInstance") || staticReader(Game.NCNetworkPlayerDataController, "LocalInstance"),
     };
 
     const G = {
@@ -1417,12 +1419,9 @@ Il2Cpp.perform(() => {
         playerDataIsReplay: bind(Game.NCNetworkPlayerData, "get_IsReplayMannequin", 0),
         playerDataModel: bind(Game.NCNetworkPlayerData, "GetPlayerModel", 0),
         playerDataSync: bind(Game.NCNetworkPlayerData, "GetPlayerSync", 0),
-        modelSetIdentity: bind(Game.PlayerModel, "set_identity", 1),
-        modelGetIdentity: bind(Game.PlayerModel, "get_identity", 0),
-        playerDataUsername: bind(Game.NCNetworkPlayerData, "get_Username", 0),
-        playerSyncUsernameTmp: bind(Game.PlayerSync, "get_UsernameTextMeshPro", 0),
-        setUsername: bind(Game.PlayerDataController, "SetUsernameINEFFICIENT", 1),
-        publishIdentity: bind(Game.PlayerDataController, "PublishLocalIdentity", 0),
+        publishIdentity: bind(Game.PlayerSync, "PublishLocalIdentity", 0),
+        sanitizeName: bind(Game.DLDisplayName, "Sanitize", 1),
+        nameHasEmoji: bind(Game.DLDisplayName, "ContainsEmoji", 1),
         modelHeight: bind(Game.PlayerModel, "get_playerHeight", 0),
         modelSetHeight: bind(Game.PlayerModel, "set_playerHeight", 1),
         modelVfxScore: bind(Game.PlayerModel, "get_vfxScore", 0),
@@ -1736,6 +1735,7 @@ Il2Cpp.perform(() => {
         playerTracers: false,
         ballTracers: false,
         increaseHoopHitbox: false,
+        customName: false,
         bigBoy: false,
     };
 
@@ -1844,56 +1844,93 @@ Il2Cpp.perform(() => {
         ]);
     }
 
+    // ───────────────────────────────── Custom name ─────────────────────────────────
+
+    // The game shows the local player's name from PlayerSync.LockSessionUsername, and
+    // PublishLocalIdentity puts that same name into the identity token everyone else reads
+    // (DLIdentityCodec: "version|userId|...|name"). Other players' games check that token and report
+    // a malformed one, or one with emoji, as tampering, so the name only goes in through the game's
+    // own path: the hook hands LockSessionUsername our name (cleaned by the game's own
+    // DLDisplayName.Sanitize), and the identity is published again whenever the name changes.
+    const CUSTOM_NAME_MAX_LENGTH = 24;
+    const CUSTOM_NAME_FALLBACK = "Baller";
+    const customName = {
+        desired: "",
+        checkedFrom: null,
+        clean: null,
+        sync: NULL,
+        published: null,
+        nextRefresh: 0,
+    };
+
+    // The name as the game will show it, or null to keep the player's own.
+    function customNameValue() {
+        if (!toggles.customName || !customName.desired)
+            return null;
+        if (customName.checkedFrom !== customName.desired) {
+            customName.checkedFrom = customName.desired;
+            customName.clean = null;
+            try {
+                const cleaned = readString(G.sanitizeName(managed(customName.desired.slice(0, CUSTOM_NAME_MAX_LENGTH))));
+                if (!cleaned || (cleaned === CUSTOM_NAME_FALLBACK && customName.desired !== CUSTOM_NAME_FALLBACK))
+                    log(`custom name "${customName.desired}" isn't a name the game accepts; keeping your own`);
+                else if (G.nameHasEmoji(managed(cleaned)))
+                    log(`custom name "${customName.desired}" has emoji, which other players' games report as tampering; keeping your own`);
+                else
+                    customName.clean = cleaned;
+            }
+            catch (error) {
+                log(`custom name check failed: ${error}`);
+            }
+        }
+        return customName.clean;
+    }
+
+    function installCustomNameHook() {
+        if (!Game.PlayerSync)
+            return;
+        // Only reached for the local player (display and identity publishing).
+        hookMethod(Game.PlayerSync, "LockSessionUsername", 0, null, (original) => function () {
+            const name = customNameValue();
+            return name === null ? original(this) : managed(name);
+        });
+    }
+
+    function updateCustomName(now) {
+        if (now < customName.nextRefresh)
+            return;
+        customName.nextRefresh = now + 1.0;
+        const sync = localPlayerSync();
+        if (sync.isNull())
+            return;
+        const wanted = customNameValue() ?? "";
+        if (!sameObject(sync, customName.sync)) {
+            // A new PlayerSync (lobby, or the script starting mid-lobby) has the player's own name
+            // published unless the game already went through the hook.
+            customName.sync = sync;
+            customName.published = "";
+        }
+        if (customName.published === wanted)
+            return;
+        try {
+            // PublishLocalIdentity skips a room it already published in; forgetting the room id
+            // makes it issue a fresh identity with the new name.
+            if (OFF.playerSync.publishedRoomId >= 0)
+                toPointer(sync).add(OFF.playerSync.publishedRoomId).writePointer(NULL);
+            G.publishIdentity(sync);
+            customName.published = wanted;
+            log(wanted ? `name set to ${wanted}` : "custom name off; using your own name");
+        }
+        catch (error) {
+            logThrottled("custom-name", 10, `custom name update failed: ${error}`);
+        }
+    }
+
     // ───────────────────────────────── Player size ─────────────────────────────────
 
     // HeightController.playerHeight is what the game syncs as the player's height; MeasureStandingHeight
     // and ComputeCredibleHeight feed its periodic recalibration, and PlayerModel.playerHeight is the
     // networked copy. Only the local player's model is touched, so other players keep their size.
-    const customName = {
-        desired: "working",
-        applied: "",
-        nextRefresh: 0,
-    };
-
-    function updateNameKeeper(now) {
-        if (!customName.desired || now < customName.nextRefresh)
-            return;
-        customName.nextRefresh = now + 1.5;
-
-        // 1. Sync over Normcore via local PlayerModel.set_identity
-        try {
-            const model = refs.localModel || localPlayerModel();
-            if (isLive(model) && G.modelSetIdentity) {
-                G.modelSetIdentity(model, managed(customName.desired));
-            }
-        }
-        catch (_) { }
-
-        // 2. Set on PlayerDataController if available
-        try {
-            const controller = statics.playerDataController ? statics.playerDataController() : NULL;
-            if (unityAlive(controller)) {
-                if (G.setUsername)
-                    G.setUsername(controller, managed(customName.desired));
-                if (G.publishIdentity)
-                    G.publishIdentity(controller);
-            }
-        }
-        catch (_) { }
-
-        // 3. Update local PlayerSync UsernameTextMeshPro if present
-        try {
-            const sync = localPlayerSync();
-            if (unityAlive(sync) && G.playerSyncUsernameTmp) {
-                const tmp = G.playerSyncUsernameTmp(sync);
-                if (unityAlive(tmp) && U.textSet) {
-                    U.textSet(tmp, managed(customName.desired));
-                }
-            }
-        }
-        catch (_) { }
-    }
-
     const playerScale = {
         mode: 0,
         baseHeight: DEFAULT_PLAYER_HEIGHT,
@@ -1982,20 +2019,6 @@ Il2Cpp.perform(() => {
             hookMethod(Game.PlayerModel, "set_playerHeight", 1, null, (original) => function (value) {
                 const forced = isScaled() && sameObject(this, refs.localModel) ? scaledHeight() : value;
                 return original(this, forced);
-            });
-            hookMethod(Game.PlayerModel, "get_identity", 0, null, (original) => function () {
-                if (customName.desired && sameObject(this, refs.localModel)) {
-                    return managed(customName.desired);
-                }
-                return original(this);
-            });
-        }
-        if (Game.NCNetworkPlayerData) {
-            hookMethod(Game.NCNetworkPlayerData, "get_Username", 0, null, (original) => function () {
-                if (customName.desired && sameObject(this, localPlayerData())) {
-                    return managed(customName.desired);
-                }
-                return original(this);
             });
         }
     }
@@ -5297,7 +5320,6 @@ Il2Cpp.perform(() => {
             username: customName.desired,
             toggles: Object.fromEntries(savedToggleKeys().map((key) => [key, toggles[key]])),
             settings: {
-                username: customName.desired,
                 shootBoostPercent: settings.shootBoostPercent,
                 pointsPerShot: settings.pointsPerShot,
                 autoAimMode: settings.autoAimMode,
@@ -5330,7 +5352,7 @@ Il2Cpp.perform(() => {
         else if (typeof saved.username === "string" && saved.username.trim().length > 0)
             customName.desired = saved.username.trim();
         else
-            customName.desired = "working";
+            customName.desired = "";
         if (Number.isFinite(saved.shootBoostPercent))
             settings.shootBoostPercent = clamp(Math.round(saved.shootBoostPercent / SHOOT_BOOST_STEP) * SHOOT_BOOST_STEP, SHOOT_BOOST_MIN, SHOOT_BOOST_MAX);
         if (POINTS_PER_SHOT_CHOICES.includes(saved.pointsPerShot))
@@ -5987,9 +6009,7 @@ Il2Cpp.perform(() => {
         switch (category) {
             case "Settings":
                 return [
-                    actionEntry("custom-name", () => `Name: ${customName.desired}`, () => {
-                        log(`current name: ${customName.desired} (change in config.json)`);
-                    }),
+                    toggleEntry("custom-name", () => `Custom Name: ${customName.desired ? customName.desired.slice(0, 16) : "(set in config)"}`, "customName"),
                     incrementEntry("shoot-boost-amount", "Shoot Boost", () => `${settings.shootBoostPercent}%`, stepShootBoost),
                     incrementEntry("auto-aim-target", "Auto Aim Target", () => settings.autoAimMode === 0 ? "Swish" : "Bank Shot", stepAimMode),
                     incrementEntry("auto-aim-guide", "Auto Aim Guide", () => settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide", stepAimGuide),
@@ -6057,7 +6077,10 @@ Il2Cpp.perform(() => {
         return entry.kind === "toggle" && Boolean(toggles[entry.key]);
     }
 
-    const entryLabel = (entry) => entry.kind === "increment" ? `${entry.label} : ${entry.value()}` : entry.label;
+    const entryLabel = (entry) => {
+        const label = typeof entry.label === "function" ? entry.label() : entry.label;
+        return entry.kind === "increment" ? `${label} : ${entry.value()}` : label;
+    };
 
     function openCategory(category) {
         menu.category = category;
@@ -6707,7 +6730,7 @@ Il2Cpp.perform(() => {
         ["hoop hitbox", updateHoopHitboxes],
         ["gold explosion", updateGoldExplosion],
         ["titles", updateTitleKeeper],
-        ["custom name", updateNameKeeper],
+        ["custom name", updateCustomName],
         ["ball orbit", updateBallOrbit],
         ["ball stack", updateBallStack],
         ["grip spawn", updateGripSpawn],
@@ -6806,6 +6829,7 @@ Il2Cpp.perform(() => {
         installScoreAwardHooks();
         installScoreEffectHooks();
         installHeightHooks();
+        installCustomNameHook();
         const update = findMethod(Game.HeightController, "Update", 0);
         if (!update)
             throw new Error("HeightController.Update not found");
