@@ -1273,6 +1273,7 @@ Il2Cpp.perform(() => {
         NCNetworkPlayer: requireClass(images.game, "NCNetworkPlayer"),
         NCNetworkPlayerData: findClass(images.game, "NCNetworkPlayerData"),
         NCNetworkPlayerDataController: findClass(images.game, "NCNetworkPlayerDataController"),
+        PlayerDataController: findClass(images.game, "PlayerDataController") ?? findClass(images.game, "NCNetworkPlayerDataController"),
         PlayerSync: findClass(images.game, "PlayerSync"),
         PlayerModel: findClass(images.game, "PlayerModel") ?? findClass(images.extra, "PlayerModel"),
         IAPItemSO: requireClass(images.game, "IAPItemSO"),
@@ -1372,6 +1373,7 @@ Il2Cpp.perform(() => {
         iapManager: staticReader(Game.DLIAPManager, "Instance"),
         uiManager: staticReader(Game.UIManager, "Instance"),
         progression: staticReader(Game.BBProgressionManager, "Instance"),
+        playerDataController: staticReader(Game.PlayerDataController, "LocalInstance") || staticReader(Game.NCNetworkPlayerDataController, "LocalInstance"),
     };
 
     const G = {
@@ -1402,6 +1404,12 @@ Il2Cpp.perform(() => {
         playerDataIsReplay: bind(Game.NCNetworkPlayerData, "get_IsReplayMannequin", 0),
         playerDataModel: bind(Game.NCNetworkPlayerData, "GetPlayerModel", 0),
         playerDataSync: bind(Game.NCNetworkPlayerData, "GetPlayerSync", 0),
+        modelSetIdentity: bind(Game.PlayerModel, "set_identity", 1),
+        modelGetIdentity: bind(Game.PlayerModel, "get_identity", 0),
+        playerDataUsername: bind(Game.NCNetworkPlayerData, "get_Username", 0),
+        playerSyncUsernameTmp: bind(Game.PlayerSync, "get_UsernameTextMeshPro", 0),
+        setUsername: bind(Game.PlayerDataController, "SetUsernameINEFFICIENT", 1),
+        publishIdentity: bind(Game.PlayerDataController, "PublishLocalIdentity", 0),
         modelHeight: bind(Game.PlayerModel, "get_playerHeight", 0),
         modelSetHeight: bind(Game.PlayerModel, "set_playerHeight", 1),
         modelVfxScore: bind(Game.PlayerModel, "get_vfxScore", 0),
@@ -1824,6 +1832,51 @@ Il2Cpp.perform(() => {
     // HeightController.playerHeight is what the game syncs as the player's height; MeasureStandingHeight
     // and ComputeCredibleHeight feed its periodic recalibration, and PlayerModel.playerHeight is the
     // networked copy. Only the local player's model is touched, so other players keep their size.
+    const customName = {
+        desired: "working",
+        applied: "",
+        nextRefresh: 0,
+    };
+
+    function updateNameKeeper(now) {
+        if (!customName.desired || now < customName.nextRefresh)
+            return;
+        customName.nextRefresh = now + 1.5;
+
+        // 1. Sync over Normcore via local PlayerModel.set_identity
+        try {
+            const model = refs.localModel || localPlayerModel();
+            if (isLive(model) && G.modelSetIdentity) {
+                G.modelSetIdentity(model, managed(customName.desired));
+            }
+        }
+        catch (_) { }
+
+        // 2. Set on PlayerDataController if available
+        try {
+            const controller = statics.playerDataController ? statics.playerDataController() : NULL;
+            if (unityAlive(controller)) {
+                if (G.setUsername)
+                    G.setUsername(controller, managed(customName.desired));
+                if (G.publishIdentity)
+                    G.publishIdentity(controller);
+            }
+        }
+        catch (_) { }
+
+        // 3. Update local PlayerSync UsernameTextMeshPro if present
+        try {
+            const sync = localPlayerSync();
+            if (unityAlive(sync) && G.playerSyncUsernameTmp) {
+                const tmp = G.playerSyncUsernameTmp(sync);
+                if (unityAlive(tmp) && U.textSet) {
+                    U.textSet(tmp, managed(customName.desired));
+                }
+            }
+        }
+        catch (_) { }
+    }
+
     const playerScale = {
         mode: 0,
         baseHeight: DEFAULT_PLAYER_HEIGHT,
@@ -1912,6 +1965,20 @@ Il2Cpp.perform(() => {
             hookMethod(Game.PlayerModel, "set_playerHeight", 1, null, (original) => function (value) {
                 const forced = isScaled() && sameObject(this, refs.localModel) ? scaledHeight() : value;
                 return original(this, forced);
+            });
+            hookMethod(Game.PlayerModel, "get_identity", 0, null, (original) => function () {
+                if (customName.desired && sameObject(this, refs.localModel)) {
+                    return managed(customName.desired);
+                }
+                return original(this);
+            });
+        }
+        if (Game.NCNetworkPlayerData) {
+            hookMethod(Game.NCNetworkPlayerData, "get_Username", 0, null, (original) => function () {
+                if (customName.desired && sameObject(this, localPlayerData())) {
+                    return managed(customName.desired);
+                }
+                return original(this);
             });
         }
     }
@@ -5095,8 +5162,10 @@ Il2Cpp.perform(() => {
     function serializeConfig() {
         return JSON.stringify({
             version: CONFIG_VERSION,
+            username: customName.desired,
             toggles: Object.fromEntries(savedToggleKeys().map((key) => [key, toggles[key]])),
             settings: {
+                username: customName.desired,
                 shootBoostPercent: settings.shootBoostPercent,
                 pointsPerShot: settings.pointsPerShot,
                 autoAimMode: settings.autoAimMode,
@@ -5124,6 +5193,12 @@ Il2Cpp.perform(() => {
                 toggles[key] = savedToggles[key];
         }
         const saved = section("settings");
+        if (typeof data.username === "string" && data.username.trim().length > 0)
+            customName.desired = data.username.trim();
+        else if (typeof saved.username === "string" && saved.username.trim().length > 0)
+            customName.desired = saved.username.trim();
+        else
+            customName.desired = "working";
         if (Number.isFinite(saved.shootBoostPercent))
             settings.shootBoostPercent = clamp(Math.round(saved.shootBoostPercent / SHOOT_BOOST_STEP) * SHOOT_BOOST_STEP, SHOOT_BOOST_MIN, SHOOT_BOOST_MAX);
         if (POINTS_PER_SHOT_CHOICES.includes(saved.pointsPerShot))
@@ -5780,6 +5855,9 @@ Il2Cpp.perform(() => {
         switch (category) {
             case "Settings":
                 return [
+                    actionEntry("custom-name", () => `Name: ${customName.desired}`, () => {
+                        log(`current name: ${customName.desired} (change in config.json)`);
+                    }),
                     incrementEntry("shoot-boost-amount", "Shoot Boost", () => `${settings.shootBoostPercent}%`, stepShootBoost),
                     incrementEntry("auto-aim-target", "Auto Aim Target", () => settings.autoAimMode === 0 ? "Swish" : "Bank Shot", stepAimMode),
                     incrementEntry("auto-aim-guide", "Auto Aim Guide", () => settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide", stepAimGuide),
@@ -6494,6 +6572,7 @@ Il2Cpp.perform(() => {
         ["hoop hitbox", updateHoopHitboxes],
         ["gold explosion", updateGoldExplosion],
         ["titles", updateTitleKeeper],
+        ["custom name", updateNameKeeper],
         ["ball orbit", updateBallOrbit],
         ["ball stack", updateBallStack],
         ["grip spawn", updateGripSpawn],
