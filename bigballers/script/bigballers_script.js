@@ -743,6 +743,8 @@ Il2Cpp.perform(() => {
         rbUseGravity: bind(Unity.Rigidbody, "get_useGravity", 0),
         rbSetUseGravity: bind(Unity.Rigidbody, "set_useGravity", 1),
         rbIsKinematic: bind(Unity.Rigidbody, "get_isKinematic", 0),
+        rbSetIsKinematic: bind(Unity.Rigidbody, "set_isKinematic", 1),
+        rbWakeUp: bind(Unity.Rigidbody, "WakeUp", 0),
         rbDamping: bind(Unity.Rigidbody, "get_linearDamping", 0),
         rbMovePosition: bind(Unity.Rigidbody, "MovePosition", 1),
         gravity: bind(Unity.Physics, "get_gravity", 0),
@@ -1392,6 +1394,10 @@ Il2Cpp.perform(() => {
         ballHeldByMe: bind(Game.NCGrabbable, "IsHeldByMe", 0),
         ballHeldBySomeoneElse: bind(Game.NCGrabbable, "IsHeldBySomeoneElse", 0),
         ballForceGrab: bind(Game.NCGrabbable, "ForceGrab", 1),
+        ballClearHeld: bind(Game.NCGrabbable, "clearHeld", 0),
+        ballTakeControlPhysics: bind(Game.NCGrabbable, "takeControlOverPhysics", 0),
+        ballAutoRelease: bind(Game.NCGrabbable, "AutoRelease", 0),
+        ballNTRequestOwnership: bind(Game.NCGrabbable, "NTRequestOwnership", 0),
         ballSlap: bind(Game.NCGrabbable, "SetBallVelocityIfAllowed", 2),
         ballHeldLocally: bind(Game.NCGrabbable, "isHeldLocally", 0),
         ballOwnedLocally: bind(Game.NCGrabbable, "NTIsOwnedLocally", 0),
@@ -1666,7 +1672,7 @@ Il2Cpp.perform(() => {
         const seen = new Set();
         try {
             if (unityAlive(refs.ballController)) {
-                for (const ball of listItems(G.grabbableBalls(refs.ballController), 64)) {
+                for (const ball of listItems(G.grabbableBalls(refs.ballController), 256)) {
                     if (!unityAlive(ball))
                         continue;
                     const key = keyOf(ball);
@@ -2447,8 +2453,10 @@ Il2Cpp.perform(() => {
         });
         // A ball you grab leaves the orbit or stack on the spot instead of at the next ownership check.
         hookMethod(Game.NCGrabbable, "OnGrab", 1, null, (original) => function (grabber) {
-            orbit.balls.delete(keyOf(this));
-            ballStack.balls.delete(keyOf(this));
+            if (!formationForceGrabbing) {
+                orbit.balls.delete(keyOf(this));
+                ballStack.balls.delete(keyOf(this));
+            }
             return original(this, grabber);
         });
     }
@@ -2522,18 +2530,61 @@ Il2Cpp.perform(() => {
     const releaseOrbitBalls = (stopMotion) => releaseFormation(orbit, stopMotion);
     const releaseBallStack = (stopMotion) => releaseFormation(ballStack, stopMotion);
 
+    let formationForceGrabbing = false;
+
+    function forceClaimBall(entry) {
+        formationForceGrabbing = true;
+        try {
+            // 1. Break active hold from any player's hand (steal)
+            if (G.ballClearHeld && G.ballClearHeld.available)
+                G.ballClearHeld(entry.ball);
+            if (G.ballAutoRelease && G.ballAutoRelease.available)
+                G.ballAutoRelease(entry.ball);
+            if (G.ballTakeControlPhysics && G.ballTakeControlPhysics.available)
+                G.ballTakeControlPhysics(entry.ball);
+
+            // 2. Request all network ownership channels
+            if (G.ballNTRequestOwnership && G.ballNTRequestOwnership.available)
+                G.ballNTRequestOwnership(entry.ball);
+            if (G.ballRequestTransformOwnership && G.ballRequestTransformOwnership.available)
+                G.ballRequestTransformOwnership(entry.ball);
+            if (G.ballRequestOwnershipIfAllowed && G.ballRequestOwnershipIfAllowed.available)
+                G.ballRequestOwnershipIfAllowed(entry.ball);
+
+            // 3. Force-grab into grabber to claim authority over Normcore
+            const grabber = freeGrabber() || refs.grabberRight || refs.grabberLeft;
+            if (unityAlive(grabber) && G.ballForceGrab && G.ballForceGrab.available) {
+                G.ballForceGrab(entry.ball, grabber);
+                if (G.ballClearHeld && G.ballClearHeld.available)
+                    G.ballClearHeld(entry.ball);
+                if (G.ballAutoRelease && G.ballAutoRelease.available)
+                    G.ballAutoRelease(entry.ball);
+            }
+
+            // 4. Wake up physics & unlock kinematic
+            if (unityAlive(entry.rigidbody)) {
+                if (U.rbWakeUp && U.rbWakeUp.available)
+                    U.rbWakeUp(entry.rigidbody);
+                if (entry.kinematic && U.rbSetIsKinematic && U.rbSetIsKinematic.available) {
+                    U.rbSetIsKinematic(entry.rigidbody, 0);
+                    entry.kinematic = false;
+                }
+            }
+        }
+        catch (_) { }
+        finally {
+            formationForceGrabbing = false;
+        }
+    }
+
     function formationEligible(ball, now) {
         if (autoAim.guidedKeys.has(ball.key))
             return false;
         const released = recentReleases.get(ball.key);
         if (released !== undefined && now - released < ORBIT_RELEASE_GRACE_SECONDS)
             return false;
-        try {
-            return !G.ballHeldBySomeone(ball.pointer);
-        }
-        catch (_) {
-            return false;
-        }
+        // All balls eligible: in hands, on ground, or moving
+        return true;
     }
 
     function rescanFormation(formation, now, center) {
@@ -2551,7 +2602,8 @@ Il2Cpp.perform(() => {
             catch (_) { }
         }
         candidates.sort((left, right) => left.distance - right.distance);
-        const chosen = candidates.slice(0, ORBIT_MAX_BALLS);
+        // REMOVED MAX LIMIT: take all balls
+        const chosen = candidates;
         const chosenKeys = new Set(chosen.map((candidate) => candidate.ball.key));
         for (const key of Array.from(formation.balls.keys())) {
             if (!chosenKeys.has(key))
@@ -2561,41 +2613,48 @@ Il2Cpp.perform(() => {
             if (!formation.balls.has(ball.key)) {
                 if (formation.onJoin)
                     formation.onJoin(ball.key, ball.pointer);
-                formation.balls.set(ball.key, {
+                const entry = {
                     ball: ball.pointer,
                     rigidbody: ball.rb,
                     owned: false,
                     kinematic: false,
                     nextCheck: 0,
                     nextRequest: 0,
-                });
+                };
+                formation.balls.set(ball.key, entry);
+                forceClaimBall(entry);
             }
         }
     }
 
-    // Only asks for the transform (never the holder's view), and only when nobody holds the ball.
     function refreshFormationOwnership(key, entry, now) {
         entry.nextCheck = now + ORBIT_OWNERSHIP_CHECK_SECONDS;
-        let held = true;
+        if (autoAim.guidedKeys.has(key))
+            return false;
+
+        let held = false;
         try {
-            held = !!G.ballHeldBySomeone(entry.ball);
+            held = !!(G.ballHeldBySomeone && G.ballHeldBySomeone(entry.ball));
         }
         catch (_) { }
-        if (held || autoAim.guidedKeys.has(key))
-            return false;
+
         try {
-            entry.owned = !!G.ballOwnedLocally(entry.ball);
-            entry.kinematic = !!U.rbIsKinematic(entry.rigidbody);
+            entry.owned = !!(G.ballOwnedLocally && G.ballOwnedLocally(entry.ball));
+            entry.kinematic = !!(U.rbIsKinematic && U.rbIsKinematic(entry.rigidbody));
         }
         catch (_) {
             entry.owned = false;
         }
-        if (!entry.owned && now >= entry.nextRequest) {
-            entry.nextRequest = now + ORBIT_OWNERSHIP_RETRY_SECONDS;
-            try {
-                G.ballRequestTransformOwnership(entry.ball);
+
+        if (held || !entry.owned) {
+            if (now >= entry.nextRequest) {
+                entry.nextRequest = now + ORBIT_OWNERSHIP_RETRY_SECONDS;
+                forceClaimBall(entry);
+                try {
+                    entry.owned = !!(G.ballOwnedLocally && G.ballOwnedLocally(entry.ball));
+                }
+                catch (_) { }
             }
-            catch (_) { }
         }
         return true;
     }
@@ -2620,8 +2679,6 @@ Il2Cpp.perform(() => {
                 formation.balls.delete(key);
                 continue;
             }
-            if (!entry.owned)
-                continue;
             const { target, drift } = place(index, count, now, center);
             try {
                 if (entry.kinematic) {
@@ -2638,6 +2695,9 @@ Il2Cpp.perform(() => {
                     velocity[2] *= scale;
                 }
                 U.rbSetVelocity(entry.rigidbody, velocity);
+                if (G.ballSetVelocities && G.ballSetVelocities.available) {
+                    G.ballSetVelocities(entry.ball, velocity, [0, 0, 0]);
+                }
             }
             catch (_) {
                 formation.balls.delete(key);
