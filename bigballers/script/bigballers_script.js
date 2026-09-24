@@ -59,7 +59,11 @@ Il2Cpp.perform(() => {
         { label: "Big Boy (2.0x)", multiplier: 2.0 },
         { label: "Giant (2.8x)", multiplier: 2.8 },
         { label: "Titan (4.0x)", multiplier: 4.0 },
+        { label: "Colossal (6.0x)", multiplier: 6.0 },
+        { label: "Mega (8.0x)", multiplier: 8.0 },
+        { label: "Max (12x)", multiplier: 12.0 },
         { label: "Mini (0.5x)", multiplier: 0.5 },
+        { label: "Tiny (0.25x)", multiplier: 0.25 },
     ];
     const BIG_BOY_PRESET = 2;
     const DEFAULT_PLAYER_HEIGHT = 1.82;
@@ -166,14 +170,25 @@ Il2Cpp.perform(() => {
 
     // Exploits
     const HOOP_HITBOX_RESCAN_SECONDS = 1.0;
-    // Steal ball: RT takes the ball your right hand points at (within the cone, any distance), or the
-    // nearest one right next to the hand.
+    // How much wider the scoring box gets; it also grows a little taller as it widens.
+    const HOOP_HITBOX_CHOICES = [
+        { width: 2, height: 1.25 },
+        { width: 4, height: 1.5 },
+        { width: 8, height: 2.0 },
+        { width: 16, height: 3.0 },
+        { width: 32, height: 4.0 },
+    ];
+    const HOOP_HITBOX_DEFAULT = 4;
+    // Steal ball: RT takes the first ball your right hand's pointer ray passes through, like a
+    // raycast: the ray "hits" a ball it passes within STEAL_BALL_RAY_RADIUS (+ a little per meter)
+    // of, and the nearest hit wins. If it hits nothing, the ball closest to the ray within the cone.
     const STEAL_BALL_TRIGGER_THRESHOLD = 0.55;
-    const STEAL_BALL_CONE_DEGREES = 25;
-    const STEAL_BALL_NEAR_DISTANCE = 1.5;
-    const STEAL_BALL_MAX_DISTANCE = 40;
-    const STEAL_BALL_TIMEOUT_SECONDS = 2.0;
-    const STEAL_BALL_RETRY_SECONDS = 0.25;
+    const STEAL_BALL_RAY_RADIUS = 0.35;
+    const STEAL_BALL_RAY_RADIUS_PER_METER = 0.03;
+    const STEAL_BALL_CONE_DEGREES = 12;
+    const STEAL_BALL_MAX_DISTANCE = 30;
+    const STEAL_BALL_TIMEOUT_SECONDS = 2.5;
+    const STEAL_BALL_OWNERSHIP_RETRY_SECONDS = 0.3;
     const STEAL_BALL_SLAP_RETRY_SECONDS = 0.6;
 
     // Progression, titles and unlock-all
@@ -1325,6 +1340,7 @@ Il2Cpp.perform(() => {
             right: fieldOffset(Game.HandManager, "HandR"),
             grabberLeft: fieldOffset(Game.HandManager, "GrabberL"),
             grabberRight: fieldOffset(Game.HandManager, "GrabberR"),
+            pointerRight: fieldOffset(Game.HandManager, "pointerR"),
         },
         controller: {
             localPlayer: fieldOffset(Game.DLGameController, "localPlayer"),
@@ -1348,6 +1364,7 @@ Il2Cpp.perform(() => {
         grabber: {
             forceGrab: fieldOffset(Game.Grabber, "ForceGrab"),
             held: fieldOffset(Game.Grabber, "HeldGrabbable"),
+            heldBall: fieldOffset(Game.Grabber, "grabbable"),
             gripAmount: fieldOffset(Game.Grabber, "GripAmount"),
         },
         ball: {
@@ -1756,6 +1773,7 @@ Il2Cpp.perform(() => {
         autoAimMode: 0, // 0 = Swish, 1 = Bank Shot
         autoAimLegit: 0, // 0 = Snap & Drop, 1 = Smooth Glide (bank shots, after the board)
         shotArc: AUTO_AIM_ARC_DEFAULT,
+        hoopHitbox: HOOP_HITBOX_DEFAULT,
         soundBoost: SOUND_BOOST_DEFAULT,
         hearSounds: true, // soundboard sounds also play on your headset
     };
@@ -2932,17 +2950,22 @@ Il2Cpp.perform(() => {
 
     // ───────────────────────────────────── Steal ball ─────────────────────────────────────
 
-    // RT takes the ball you point at with your right hand, at any distance, without touching it. A
-    // ball someone is holding is knocked out of their hand through the game's own slap (its steal
-    // rules and cooldown apply, and it's what makes their game let go); once nobody holds it, the
-    // game's forced grab puts it in your hand and takes ownership the normal way.
-    const stealBall = { triggerHeld: false, attempt: null };
+    // RT takes the ball your right hand's pointer is aimed at, at any distance. A ball someone is
+    // holding is knocked out of their hand through the game's own slap (its steal rules and cooldown
+    // apply, and it's what makes their game let go). Once nobody holds it, its ownership is asked for
+    // first: the game drops a held ball the moment it isn't ours (Grabber.CheckGrabRelease), so
+    // grabbing before that just drops and re-grabs it. Then the game's forced grab puts it in your
+    // hand, and it stays there while RT is held; letting go of RT hands it back to the grip, so
+    // without grip it's thrown like any ball.
+    const stealBall = { triggerHeld: false, attempt: null, keep: null };
 
     const handHolding = (grabber) => OFF.grabber.held >= 0 && unityAlive(readPointerAt(grabber, OFF.grabber.held));
+    const handHoldsBall = (grabber, ball) => OFF.grabber.heldBall >= 0 && handHolding(grabber) && sameObject(readPointerAt(grabber, OFF.grabber.heldBall), ball);
 
     function resetStealBall() {
         stealBall.triggerHeld = false;
         stealBall.attempt = null;
+        stealBall.keep = null;
     }
 
     function freeGrabber() {
@@ -2953,28 +2976,54 @@ Il2Cpp.perform(() => {
         return NULL;
     }
 
-    function stealTarget(now) {
-        const hand = unityAlive(refs.rightHand) ? U.position(refs.rightHand) : null;
-        if (!hand)
+    // The game's own pointer on the right hand shows where it aims; the hand transform is the
+    // fallback.
+    function stealRay() {
+        let source = NULL;
+        try {
+            if (OFF.hand.pointerRight >= 0 && unityAlive(refs.handManager)) {
+                const pointer = readPointerAt(refs.handManager, OFF.hand.pointerRight);
+                if (unityAlive(pointer))
+                    source = U.gameObjectTransform(pointer);
+            }
+        }
+        catch (_) { }
+        if (!unityAlive(source))
+            source = refs.rightHand;
+        if (!unityAlive(source))
             return null;
-        const pointing = U.forward(refs.rightHand);
-        const pointingLength = Math.hypot(pointing[0], pointing[1], pointing[2]) || 1;
-        const coneCosine = Math.cos(STEAL_BALL_CONE_DEGREES * DEG);
+        const direction = U.forward(source);
+        const length = Math.hypot(direction[0], direction[1], direction[2]);
+        if (length < 0.0001)
+            return null;
+        return { origin: U.position(source), direction: direction.map((value) => value / length) };
+    }
+
+    function stealTarget(now) {
+        const ray = stealRay();
+        if (!ray)
+            return null;
         let best = null;
         for (const ball of trackedBalls(now)) {
             try {
                 if (!unityAlive(ball.rb) || G.ballHeldByMe(ball.pointer))
                     continue;
                 const position = U.rbPosition(ball.rb);
-                const offset = [position[0] - hand[0], position[1] - hand[1], position[2] - hand[2]];
+                const offset = [position[0] - ray.origin[0], position[1] - ray.origin[1], position[2] - ray.origin[2]];
                 const distance = Math.hypot(offset[0], offset[1], offset[2]);
-                if (distance > STEAL_BALL_MAX_DISTANCE)
+                if (distance > STEAL_BALL_MAX_DISTANCE || distance < 0.001)
                     continue;
-                // Right next to the hand wins outright; otherwise the ball closest to the pointing ray.
-                const score = distance <= STEAL_BALL_NEAR_DISTANCE
-                    ? 2 + (STEAL_BALL_NEAR_DISTANCE - distance)
-                    : (offset[0] * pointing[0] + offset[1] * pointing[1] + offset[2] * pointing[2]) / (distance * pointingLength);
-                if (score >= coneCosine && (!best || score > best.score))
+                const along = offset[0] * ray.direction[0] + offset[1] * ray.direction[1] + offset[2] * ray.direction[2];
+                if (along <= 0)
+                    continue;
+                const angle = Math.acos(clamp(along / distance, -1, 1)) / DEG;
+                if (angle > STEAL_BALL_CONE_DEGREES)
+                    continue;
+                const miss = Math.sqrt(Math.max(0, distance * distance - along * along));
+                const hit = miss <= STEAL_BALL_RAY_RADIUS + distance * STEAL_BALL_RAY_RADIUS_PER_METER;
+                // Hits rank by distance along the ray, ahead of every near-miss (ranked by angle).
+                const score = hit ? along : 1000 + angle;
+                if (!best || score < best.score)
                     best = { ball, position, score };
             }
             catch (_) { }
@@ -2988,7 +3037,14 @@ Il2Cpp.perform(() => {
             log("steal ball: point your right hand at a ball");
             return;
         }
-        stealBall.attempt = { ball: target.ball.pointer, key: target.ball.key, until: now + STEAL_BALL_TIMEOUT_SECONDS, nextGrab: 0, nextSlap: 0 };
+        stealBall.attempt = {
+            ball: target.ball.pointer,
+            key: target.ball.key,
+            until: now + STEAL_BALL_TIMEOUT_SECONDS,
+            nextOwnership: 0,
+            nextSlap: 0,
+            grabber: NULL,
+        };
     }
 
     function slapTowardHand(attempt, now) {
@@ -2999,6 +3055,21 @@ Il2Cpp.perform(() => {
         const length = Math.hypot(toHand[0], toHand[1], toHand[2]) || 1;
         const speed = Math.min(12, length * 3);
         G.ballSlap(attempt.ball, toHand.map((value) => value / length * speed), 1);
+    }
+
+    function installStealBallHook() {
+        if (!Game.Grabber)
+            return;
+        // Called every frame for a hand that's holding something; RT keeps a stolen ball in hand.
+        hookMethod(Game.Grabber, "playerDidActivateRelease", 1, null, (original) => function (held) {
+            const kept = stealBall.keep;
+            if (kept && sameObject(this, kept.grabber)) {
+                if (toggles.stealBall && input.rightTrigger >= STEAL_BALL_TRIGGER_THRESHOLD && handHoldsBall(kept.grabber, kept.ball))
+                    return false;
+                stealBall.keep = null;
+            }
+            return original(this, held);
+        });
     }
 
     function updateStealBall(now) {
@@ -3016,9 +3087,16 @@ Il2Cpp.perform(() => {
                 stealBall.attempt = null;
                 return;
             }
-            if (G.ballHeldByMe(attempt.ball)) {
-                log("steal ball: got it");
-                stealBall.attempt = null;
+            // The grab already happened: done once the hand really has it.
+            if (!attempt.grabber.isNull()) {
+                if (handHoldsBall(attempt.grabber, attempt.ball)) {
+                    stealBall.keep = { grabber: attempt.grabber, ball: attempt.ball };
+                    stealBall.attempt = null;
+                    log("steal ball: got it");
+                }
+                else if (!G.ballOwnedLocally(attempt.ball)) {
+                    attempt.grabber = NULL;
+                }
                 return;
             }
             if (G.ballHeldBySomeoneElse(attempt.ball)) {
@@ -3026,9 +3104,13 @@ Il2Cpp.perform(() => {
                     slapTowardHand(attempt, now);
                 return;
             }
-            if (now < attempt.nextGrab)
+            if (!G.ballOwnedLocally(attempt.ball)) {
+                if (now >= attempt.nextOwnership) {
+                    attempt.nextOwnership = now + STEAL_BALL_OWNERSHIP_RETRY_SECONDS;
+                    G.ballRequestOwnershipIfAllowed(attempt.ball);
+                }
                 return;
-            attempt.nextGrab = now + STEAL_BALL_RETRY_SECONDS;
+            }
             const grabber = freeGrabber();
             if (grabber.isNull()) {
                 log("steal ball: both hands are full");
@@ -3036,6 +3118,7 @@ Il2Cpp.perform(() => {
                 return;
             }
             G.ballForceGrab(attempt.ball, grabber);
+            attempt.grabber = grabber;
         }
         catch (error) {
             logThrottled("steal-ball", 5, `steal ball failed: ${error}`);
@@ -3457,6 +3540,15 @@ Il2Cpp.perform(() => {
 
     const hoopHitbox = { colliders: new Map(), nextRescan: 0, scope: [] };
 
+    const hoopHitboxChoice = () => HOOP_HITBOX_CHOICES.find((choice) => choice.width === settings.hoopHitbox) ?? HOOP_HITBOX_CHOICES[1];
+
+    function stepHoopHitbox(delta) {
+        const index = HOOP_HITBOX_CHOICES.indexOf(hoopHitboxChoice());
+        settings.hoopHitbox = HOOP_HITBOX_CHOICES[clamp(index + delta, 0, HOOP_HITBOX_CHOICES.length - 1)].width;
+        hoopHitbox.nextRescan = 0;
+        log(`hoop hitbox size set to ${settings.hoopHitbox}x`);
+    }
+
     function expandHoopCollider(collider) {
         if (!unityAlive(collider))
             return false;
@@ -3472,7 +3564,8 @@ Il2Cpp.perform(() => {
             }
         }
         const original = tracked.originalSize;
-        const expanded = [Math.max(0.25, original[0] * 4.0), Math.max(0.25, original[1] * 1.5), Math.max(0.25, original[2] * 4.0)];
+        const { width, height } = hoopHitboxChoice();
+        const expanded = [Math.max(0.25, original[0] * width), Math.max(0.25, original[1] * height), Math.max(0.25, original[2] * width)];
         try {
             const current = U.boxSize(collider);
             if (current.every((value, axis) => Math.abs(value - expanded[axis]) < 0.0001))
@@ -5359,6 +5452,7 @@ Il2Cpp.perform(() => {
                 autoAimMode: settings.autoAimMode,
                 autoAimLegit: settings.autoAimLegit,
                 shotArc: settings.shotArc,
+                hoopHitbox: settings.hoopHitbox,
                 playerSize: scalePreset().multiplier,
                 soundVolume: settings.soundBoost,
                 hearSounds: settings.hearSounds,
@@ -5398,6 +5492,8 @@ Il2Cpp.perform(() => {
             settings.autoAimLegit = saved.autoAimLegit;
         if (AUTO_AIM_ARC_CHOICES.some((choice) => choice.degrees === saved.shotArc))
             settings.shotArc = saved.shotArc;
+        if (HOOP_HITBOX_CHOICES.some((choice) => choice.width === saved.hoopHitbox))
+            settings.hoopHitbox = saved.hoopHitbox;
         if (SOUND_BOOST_CHOICES.includes(saved.soundVolume))
             settings.soundBoost = saved.soundVolume;
         if (typeof saved.hearSounds === "boolean")
@@ -6083,6 +6179,7 @@ Il2Cpp.perform(() => {
                     toggleEntry("hoop-hitbox", "Increase Hoop Hitbox", "increaseHoopHitbox"),
                     incrementEntry("points-per-shot", "Points Per Shot",
                         () => settings.pointsPerShot === 1 ? "1 (Default)" : String(settings.pointsPerShot), stepPointsPerShot),
+                    incrementEntry("hoop-hitbox-size", "Hoop Hitbox Size", () => `${settings.hoopHitbox}x`, stepHoopHitbox),
                 ];
             case "Spawning":
                 return [
@@ -6876,6 +6973,7 @@ Il2Cpp.perform(() => {
         installScoreEffectHooks();
         installHeightHooks();
         installCustomNameHook();
+        installStealBallHook();
         const update = findMethod(Game.HeightController, "Update", 0);
         if (!update)
             throw new Error("HeightController.Update not found");
