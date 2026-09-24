@@ -75,14 +75,23 @@ Il2Cpp.perform(() => {
     const AUTO_AIM_MAX_FLIGHT_TIME = 2.40;
     const AUTO_AIM_TIME_BASE = 0.72;
     const AUTO_AIM_METERS_PER_SECOND = 24.0;
-    const AUTO_AIM_GATE_HEIGHT = 0.55;
     const AUTO_AIM_GATE_DROP_SPEED = 3.25;
-    // Swish shots come down through the center of the rim at least this steeply, so the arc scores on
+    // Swish shots come down through the center of the rim at the Shot Arc angle, so the arc scores on
     // its own even if the in-flight guidance never gets to run (server lag, ownership still on its
-    // way). At 55 degrees the rim leaves ~14 cm of room either way; aiming above the rim plane would
-    // carry the ball past the center toward the back rim.
-    const AUTO_AIM_MIN_ENTRY_DEGREES = 55;
+    // way). Steeper is more forgiving: 45 degrees leaves ~10 cm of room, 55 ~14 cm, 65+ ~17 cm.
+    const AUTO_AIM_ARC_CHOICES = [
+        { degrees: 45, label: "Low" },
+        { degrees: 55, label: "Normal" },
+        { degrees: 65, label: "High" },
+        { degrees: 75, label: "Very High" },
+        { degrees: 85, label: "Sky" },
+    ];
+    const AUTO_AIM_ARC_DEFAULT = 55;
     const AUTO_AIM_ENTRY_HEIGHT = 0.0;
+    // In flight, a swish shot is re-aimed at the rim center whenever it would cross it more than
+    // AUTO_AIM_HOMING_TOLERANCE off, so it drops straight in instead of clipping the rim.
+    const AUTO_AIM_HOMING_INTERVAL = 0.05;
+    const AUTO_AIM_HOMING_TOLERANCE = 0.03;
     // While a shot is ours it's held to the planned arc: anything that knocks it off (the game's own
     // throw velocity landing late, a laggy correction) gets steered back.
     const AUTO_AIM_PATH_TOLERANCE = 0.25;
@@ -1745,7 +1754,8 @@ Il2Cpp.perform(() => {
         shootBoostPercent: SHOOT_BOOST_DEFAULT,
         pointsPerShot: 1,
         autoAimMode: 0, // 0 = Swish, 1 = Bank Shot
-        autoAimLegit: 0, // 0 = Snap & Drop, 1 = Smooth Glide
+        autoAimLegit: 0, // 0 = Snap & Drop, 1 = Smooth Glide (bank shots, after the board)
+        shotArc: AUTO_AIM_ARC_DEFAULT,
         soundBoost: SOUND_BOOST_DEFAULT,
         hearSounds: true, // soundboard sounds also play on your headset
     };
@@ -2235,9 +2245,9 @@ Il2Cpp.perform(() => {
         return Math.sqrt(Math.max(0.1, 2 * (rise + horizontal * Math.tan(degrees * Math.PI / 180)) / g));
     }
 
-    function computeAimVelocity(start, target, flightTime, physics) {
+    function computeAimVelocity(start, target, flightTime, physics, minimumTime = 0.35) {
         const { gravity, damping } = physics;
-        const time = Math.max(0.35, flightTime);
+        const time = Math.max(minimumTime, flightTime);
         if (damping < 0.0001) {
             return [0, 1, 2].map((axis) => (target[axis] - start[axis]) / time - 0.5 * gravity[axis] * time);
         }
@@ -2325,7 +2335,35 @@ Il2Cpp.perform(() => {
         return false;
     }
 
-    // Steers the ball back onto its planned arc when something knocked it off.
+    // Swish shots: every AUTO_AIM_HOMING_INTERVAL, work out where the ball will cross the rim; if
+    // that's off by more than the tolerance, re-aim it at the rim center for the time that's left.
+    function homeOnHoop(guided, position, velocity, now) {
+        const plan = guided.plan;
+        if (now < plan.nextHoming)
+            return;
+        const remaining = plan.arrival - now;
+        if (remaining < 0.04)
+            return;
+        plan.nextHoming = now + AUTO_AIM_HOMING_INTERVAL;
+        const { gravity, step } = plan.physics;
+        const raised = [0, 1, 2].map((axis) => plan.target[axis] - 0.5 * gravity[axis] * step * remaining);
+        const needed = computeAimVelocity(position, raised, remaining, plan.physics, 0.04);
+        const miss = Math.hypot(needed[0] - velocity[0], needed[1] - velocity[1], needed[2] - velocity[2]) * remaining;
+        if (miss <= AUTO_AIM_HOMING_TOLERANCE)
+            return;
+        if (!ensureGuidedOwnership(guided, now))
+            return;
+        const speed = Math.hypot(needed[0], needed[1], needed[2]);
+        if (speed > AUTO_AIM_PATH_MAX_SPEED) {
+            const scale = AUTO_AIM_PATH_MAX_SPEED / speed;
+            needed[0] *= scale;
+            needed[1] *= scale;
+            needed[2] *= scale;
+        }
+        U.rbSetVelocity(guided.rigidbody, needed);
+    }
+
+    // Bank shots: steers the ball back onto its planned arc when something knocked it off.
     function followPlannedArc(guided, position, velocity, now) {
         const plan = guided.plan;
         const elapsed = now - plan.launchedAt;
@@ -2364,7 +2402,6 @@ Il2Cpp.perform(() => {
             if (autoAim.guided.length === 0)
                 return;
         }
-        const frameTime = clamp(deltaTime, 0.01, 0.05);
         for (let index = autoAim.guided.length - 1; index >= 0; index--) {
             const guided = autoAim.guided[index];
             if (now > guided.expiresAt || !unityAlive(guided.ball) || !unityAlive(guided.rigidbody)) {
@@ -2379,6 +2416,12 @@ Il2Cpp.perform(() => {
                 const position = U.rbPosition(guided.rigidbody);
                 const velocity = U.rbVelocity(guided.rigidbody);
                 const hoop = guided.hoop;
+                if (guided.plan && guided.plan.swish) {
+                    homeOnHoop(guided, position, velocity, now);
+                    if (now > guided.plan.arrival && position[1] < hoop[1] - 0.72)
+                        removeGuidedBall(index);
+                    continue;
+                }
                 if (!guided.terminal && !guided.bounced && guided.plan)
                     followPlannedArc(guided, position, velocity, now);
                 if (settings.autoAimMode === 1 && guided.backboardTarget && guided.boardDirection && !guided.bounced) {
@@ -2389,21 +2432,6 @@ Il2Cpp.perform(() => {
                     if ((boardDistance <= 0.85 && towardBoard < -0.15) || boardDistance <= 0.35) {
                         guided.terminal = true;
                         guided.bounced = true;
-                    }
-                }
-                if (!guided.terminal && settings.autoAimMode === 0) {
-                    const horizontalDistance = Math.hypot(hoop[0] - position[0], hoop[2] - position[2]);
-                    const horizontalSpeed = Math.hypot(velocity[0], velocity[2]);
-                    const captureDistance = clamp(horizontalSpeed * frameTime * 2.2, 0.38, 1.25);
-                    if (velocity[1] < 0 &&
-                        horizontalDistance <= captureDistance &&
-                        position[1] >= hoop[1] + 0.30 &&
-                        position[1] <= hoop[1] + 2.25) {
-                        if (!ensureGuidedOwnership(guided, now))
-                            continue;
-                        if (settings.autoAimLegit === 0)
-                            U.rbSetPosition(guided.rigidbody, [hoop[0], hoop[1] + AUTO_AIM_GATE_HEIGHT, hoop[2]]);
-                        guided.terminal = true;
                     }
                 }
                 if (!guided.terminal)
@@ -2463,7 +2491,7 @@ Il2Cpp.perform(() => {
             flightTime = Math.max(0.18, flightTime + arcFactor - heightFactor);
         }
         if (settings.autoAimMode === 0)
-            flightTime = Math.max(flightTime, steepArcTime(start, aimTarget, physics.gravity, AUTO_AIM_MIN_ENTRY_DEGREES));
+            flightTime = steepArcTime(start, aimTarget, physics.gravity, settings.shotArc);
         // The physics step adds velocity before moving the ball, so over a flight it ends up
         // ½·g·step·T below the exact arc; aim that much higher to land where the arc says.
         const stepTarget = [0, 1, 2].map((axis) => aimTarget[axis] - 0.5 * physics.gravity[axis] * physics.step * flightTime);
@@ -2487,7 +2515,11 @@ Il2Cpp.perform(() => {
             velocity: aimed,
             physics,
             launchedAt: now,
-            followUntil: Math.max(0, flightTime - (settings.autoAimMode === 1 ? 0.12 : 0.05)),
+            followUntil: Math.max(0, flightTime - 0.12),
+            swish: settings.autoAimMode === 0,
+            target: aimTarget,
+            arrival: now + flightTime,
+            nextHoming: now + AUTO_AIM_HOMING_INTERVAL,
         };
         trackGuidedBall(ball, rigidbody, hoop, flightTime, backboardTarget, boardDirection, now, forced, plan);
         return true;
@@ -5326,6 +5358,7 @@ Il2Cpp.perform(() => {
                 pointsPerShot: settings.pointsPerShot,
                 autoAimMode: settings.autoAimMode,
                 autoAimLegit: settings.autoAimLegit,
+                shotArc: settings.shotArc,
                 playerSize: scalePreset().multiplier,
                 soundVolume: settings.soundBoost,
                 hearSounds: settings.hearSounds,
@@ -5363,6 +5396,8 @@ Il2Cpp.perform(() => {
             settings.autoAimMode = saved.autoAimMode;
         if (saved.autoAimLegit === 0 || saved.autoAimLegit === 1)
             settings.autoAimLegit = saved.autoAimLegit;
+        if (AUTO_AIM_ARC_CHOICES.some((choice) => choice.degrees === saved.shotArc))
+            settings.shotArc = saved.shotArc;
         if (SOUND_BOOST_CHOICES.includes(saved.soundVolume))
             settings.soundBoost = saved.soundVolume;
         if (typeof saved.hearSounds === "boolean")
@@ -5992,6 +6027,14 @@ Il2Cpp.perform(() => {
         log(`auto aim target set to ${settings.autoAimMode === 0 ? "Swish" : "Bank Shot"}`);
     }
 
+    const shotArcChoice = () => AUTO_AIM_ARC_CHOICES.find((choice) => choice.degrees === settings.shotArc) ?? AUTO_AIM_ARC_CHOICES[1];
+
+    function stepShotArc(delta) {
+        const index = AUTO_AIM_ARC_CHOICES.indexOf(shotArcChoice());
+        settings.shotArc = AUTO_AIM_ARC_CHOICES[clamp(index + delta, 0, AUTO_AIM_ARC_CHOICES.length - 1)].degrees;
+        log(`shot arc set to ${shotArcChoice().label} (${settings.shotArc} deg)`);
+    }
+
     function stepAimGuide(delta) {
         settings.autoAimLegit = (settings.autoAimLegit + delta + 2) % 2;
         log(`auto aim guide set to ${settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide"}`);
@@ -6014,7 +6057,8 @@ Il2Cpp.perform(() => {
                     toggleEntry("custom-name", () => `Custom Name: ${customName.desired ? customName.desired.slice(0, 16) : "(set in config)"}`, "customName"),
                     incrementEntry("shoot-boost-amount", "Shoot Boost", () => `${settings.shootBoostPercent}%`, stepShootBoost),
                     incrementEntry("auto-aim-target", "Auto Aim Target", () => settings.autoAimMode === 0 ? "Swish" : "Bank Shot", stepAimMode),
-                    incrementEntry("auto-aim-guide", "Auto Aim Guide", () => settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide", stepAimGuide),
+                    incrementEntry("auto-aim-guide", "Bank Shot Guide", () => settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide", stepAimGuide),
+                    incrementEntry("shot-arc", "Shot Arc", () => shotArcChoice().label, stepShotArc),
                     playerSizeEntry("player-size"),
                 ];
             case "Movement":
