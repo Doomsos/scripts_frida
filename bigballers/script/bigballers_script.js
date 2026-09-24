@@ -212,8 +212,10 @@ Il2Cpp.perform(() => {
     const CONFIG_VERSION = 1;
     const CONFIG_SAVE_DELAY_SECONDS = 0.5;
     const LOG_FILE = "log.txt";
-    // Soundboard: .wav files go in Overdose/Sounds; their voice-chat copies live in the cache.
+    // Soundboard: audio files go in Overdose/Sounds; their voice-chat copies live in the cache.
+    // WAV is read directly; everything else goes through Android's own decoder (libmediandk).
     const SOUNDS_DIRECTORY = "Sounds";
+    const SOUND_FILE_PATTERN = /\.(wav|mp3|ogg|oga|opus|m4a|aac|flac|amr|3gp|webm|mka)$/i;
     // Soundboard loudness: sounds are brought to full scale, then pushed this much louder with a
     // soft limiter. Vivox sends injected audio as-is, so quiet files come out much quieter than voice;
     // the top settings sound louder still but more distorted.
@@ -5712,6 +5714,7 @@ Il2Cpp.perform(() => {
         sourceScope: [],
         clipScope: [],
         vivox: undefined,
+        media: undefined,
     };
 
     const libcDirectory = {
@@ -5768,10 +5771,10 @@ Il2Cpp.perform(() => {
         makeDirectories(directory);
         makeDirectories(`${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`);
         soundboard.sounds = listDirectory(directory)
-            .filter((name) => /\.wav$/i.test(name))
+            .filter((name) => SOUND_FILE_PATTERN.test(name) && !name.startsWith("."))
             .sort((a, b) => a.localeCompare(b))
             .map((name) => {
-                const stem = name.replace(/\.wav$/i, "");
+                const stem = name.replace(SOUND_FILE_PATTERN, "");
                 return {
                     name,
                     path: `${directory}/${name}`,
@@ -5794,7 +5797,7 @@ Il2Cpp.perform(() => {
         stopSounds(true);
         forgetPreparedSounds();
         const count = refreshSounds();
-        log(count > 0 ? `loaded ${count} sound(s)` : `no sounds found; put .wav files in ${soundsDirectory()}`);
+        log(count > 0 ? `loaded ${count} sound(s)` : `no sounds found; put audio files (.wav, .mp3, .ogg, .m4a...) in ${soundsDirectory()}`);
     }
 
     // ─── WAV decoding ───
@@ -5849,6 +5852,209 @@ Il2Cpp.perform(() => {
             mono[frame] = sum / format.channels;
         }
         return { samples: mono, rate: format.rate, truncated: Math.floor(dataLength / frameBytes) > frames };
+    }
+
+    // ─── Other formats: Android's decoder ───
+
+    const toNumber = (value) => typeof value === "number" ? value : value.toNumber();
+
+    function mediaNatives() {
+        if (soundboard.media !== undefined)
+            return soundboard.media;
+        soundboard.media = null;
+        try {
+            const module = Process.findModuleByName("libmediandk.so") ?? Module.load("libmediandk.so");
+            const fn = (name, returnType, argumentTypes) => new NativeFunction(module.getExportByName(name), returnType, argumentTypes);
+            const libcFn = (name, returnType, argumentTypes) => {
+                const found = libcFunction(name, returnType, argumentTypes);
+                if (!found)
+                    throw new Error(`libc ${name} is missing`);
+                return found;
+            };
+            soundboard.media = {
+                open: libcFn("open", "int", ["pointer", "int"]),
+                seek: libcFn("lseek", "int64", ["int", "int64", "int"]),
+                close: libcFn("close", "int", ["int"]),
+                extractorNew: fn("AMediaExtractor_new", "pointer", []),
+                extractorDelete: fn("AMediaExtractor_delete", "int", ["pointer"]),
+                extractorSetSource: fn("AMediaExtractor_setDataSourceFd", "int", ["pointer", "int", "int64", "int64"]),
+                trackCount: fn("AMediaExtractor_getTrackCount", "size_t", ["pointer"]),
+                trackFormat: fn("AMediaExtractor_getTrackFormat", "pointer", ["pointer", "size_t"]),
+                selectTrack: fn("AMediaExtractor_selectTrack", "int", ["pointer", "size_t"]),
+                readSample: fn("AMediaExtractor_readSampleData", "ssize_t", ["pointer", "pointer", "size_t"]),
+                sampleTime: fn("AMediaExtractor_getSampleTime", "int64", ["pointer"]),
+                advance: fn("AMediaExtractor_advance", "bool", ["pointer"]),
+                formatDelete: fn("AMediaFormat_delete", "int", ["pointer"]),
+                formatString: fn("AMediaFormat_getString", "bool", ["pointer", "pointer", "pointer"]),
+                formatInt: fn("AMediaFormat_getInt32", "bool", ["pointer", "pointer", "pointer"]),
+                codecCreate: fn("AMediaCodec_createDecoderByType", "pointer", ["pointer"]),
+                codecConfigure: fn("AMediaCodec_configure", "int", ["pointer", "pointer", "pointer", "pointer", "uint32"]),
+                codecStart: fn("AMediaCodec_start", "int", ["pointer"]),
+                codecStop: fn("AMediaCodec_stop", "int", ["pointer"]),
+                codecDelete: fn("AMediaCodec_delete", "int", ["pointer"]),
+                inputIndex: fn("AMediaCodec_dequeueInputBuffer", "ssize_t", ["pointer", "int64"]),
+                inputBuffer: fn("AMediaCodec_getInputBuffer", "pointer", ["pointer", "size_t", "pointer"]),
+                queueInput: fn("AMediaCodec_queueInputBuffer", "int", ["pointer", "size_t", "int64", "size_t", "int64", "uint32"]),
+                outputIndex: fn("AMediaCodec_dequeueOutputBuffer", "ssize_t", ["pointer", "pointer", "int64"]),
+                outputBuffer: fn("AMediaCodec_getOutputBuffer", "pointer", ["pointer", "size_t", "pointer"]),
+                outputFormat: fn("AMediaCodec_getOutputFormat", "pointer", ["pointer"]),
+                releaseOutput: fn("AMediaCodec_releaseOutputBuffer", "int", ["pointer", "size_t", "bool"]),
+                keys: {
+                    mime: Memory.allocUtf8String("mime"),
+                    rate: Memory.allocUtf8String("sample-rate"),
+                    channels: Memory.allocUtf8String("channel-count"),
+                    encoding: Memory.allocUtf8String("pcm-encoding"),
+                },
+            };
+        }
+        catch (error) {
+            log(`only .wav sounds will play: Android's audio decoder isn't available (${error.message})`);
+        }
+        return soundboard.media;
+    }
+
+    const MEDIA_END_OF_STREAM = 4;
+    const MEDIA_FORMAT_CHANGED = -2;
+    const MEDIA_PCM_FLOAT = 4;
+
+    // Decodes the first audio track to mono samples, like decodeWav.
+    function decodeWithMediaCodec(filePath) {
+        const media = mediaNatives();
+        if (!media)
+            throw new Error("this headset can't decode that format; use .wav");
+        const fd = media.open(Memory.allocUtf8String(filePath), 0);
+        if (fd < 0)
+            throw new Error("can't open the file");
+        let extractor = NULL;
+        let codec = NULL;
+        let format = NULL;
+        try {
+            const length = media.seek(fd, 0, 2);
+            extractor = media.extractorNew();
+            if (media.extractorSetSource(extractor, fd, 0, length) !== 0)
+                throw new Error("not an audio file Android can read");
+            const out = Memory.alloc(Process.pointerSize);
+            const readInt = (source, key, fallback) => media.formatInt(source, key, out) ? out.readS32() : fallback;
+            let mime = null;
+            const tracks = toNumber(media.trackCount(extractor));
+            for (let index = 0; index < tracks && format.isNull(); index++) {
+                const candidate = media.trackFormat(extractor, index);
+                if (media.formatString(candidate, media.keys.mime, out)) {
+                    const type = out.readPointer().readUtf8String();
+                    if (type && type.startsWith("audio/")) {
+                        mime = type;
+                        format = candidate;
+                        media.selectTrack(extractor, index);
+                        continue;
+                    }
+                }
+                media.formatDelete(candidate);
+            }
+            if (format.isNull())
+                throw new Error("the file has no audio track");
+            let rate = readInt(format, media.keys.rate, 44100);
+            let channels = Math.max(1, readInt(format, media.keys.channels, 2));
+            let encoding = 2;
+            codec = media.codecCreate(Memory.allocUtf8String(mime));
+            if (codec.isNull())
+                throw new Error(`no decoder for ${mime}`);
+            if (media.codecConfigure(codec, format, NULL, NULL, 0) !== 0 || media.codecStart(codec) !== 0) {
+                media.codecDelete(codec);
+                codec = NULL;
+                throw new Error(`the ${mime} decoder didn't start`);
+            }
+            const info = Memory.alloc(24);
+            const size = Memory.alloc(8);
+            const chunks = [];
+            let frames = 0;
+            let truncated = false;
+            let inputDone = false;
+            for (let spin = 0; spin < 100000; spin++) {
+                if (!inputDone) {
+                    const slot = toNumber(media.inputIndex(codec, 2000));
+                    if (slot >= 0) {
+                        const buffer = media.inputBuffer(codec, slot, size);
+                        const read = toNumber(media.readSample(extractor, buffer, size.readU64()));
+                        if (read < 0) {
+                            media.queueInput(codec, slot, 0, 0, 0, MEDIA_END_OF_STREAM);
+                            inputDone = true;
+                        }
+                        else {
+                            media.queueInput(codec, slot, 0, read, media.sampleTime(extractor), 0);
+                            media.advance(extractor);
+                        }
+                    }
+                }
+                const output = toNumber(media.outputIndex(codec, info, 2000));
+                if (output === MEDIA_FORMAT_CHANGED) {
+                    const changed = media.outputFormat(codec);
+                    rate = readInt(changed, media.keys.rate, rate);
+                    channels = Math.max(1, readInt(changed, media.keys.channels, channels));
+                    encoding = readInt(changed, media.keys.encoding, encoding);
+                    media.formatDelete(changed);
+                    continue;
+                }
+                if (output < 0)
+                    continue;
+                const offset = info.readS32();
+                const bytes = info.add(4).readS32();
+                const flags = info.add(16).readU32();
+                if (bytes > 0) {
+                    const raw = media.outputBuffer(codec, output, size).add(offset).readByteArray(bytes);
+                    const values = encoding === MEDIA_PCM_FLOAT ? new Float32Array(raw) : new Int16Array(raw);
+                    const scale = encoding === MEDIA_PCM_FLOAT ? 1 : 1 / 32768;
+                    const count = Math.min(Math.floor(values.length / channels), rate * SOUND_MAX_SECONDS - frames);
+                    const mono = new Float32Array(Math.max(0, count));
+                    for (let frame = 0; frame < mono.length; frame++) {
+                        let sum = 0;
+                        for (let channel = 0; channel < channels; channel++)
+                            sum += values[frame * channels + channel];
+                        mono[frame] = sum * scale / channels;
+                    }
+                    chunks.push(mono);
+                    frames += mono.length;
+                    truncated = frames >= rate * SOUND_MAX_SECONDS;
+                }
+                media.releaseOutput(codec, output, false);
+                if (truncated || (flags & MEDIA_END_OF_STREAM))
+                    break;
+            }
+            if (frames === 0)
+                throw new Error("the decoder produced no audio");
+            const samples = new Float32Array(frames);
+            let at = 0;
+            for (const chunk of chunks) {
+                samples.set(chunk, at);
+                at += chunk.length;
+            }
+            return { samples, rate, truncated };
+        }
+        finally {
+            if (!codec.isNull()) {
+                media.codecStop(codec);
+                media.codecDelete(codec);
+            }
+            if (!format.isNull())
+                media.formatDelete(format);
+            if (!extractor.isNull())
+                media.extractorDelete(extractor);
+            media.close(fd);
+        }
+    }
+
+    // WAV is read directly; other formats, and WAVs in encodings decodeWav doesn't handle, go through
+    // Android's decoder.
+    function decodeSound(sound) {
+        if (/\.wav$/i.test(sound.name)) {
+            try {
+                return decodeWav(File.readAllBytes(sound.path));
+            }
+            catch (error) {
+                if (!mediaNatives())
+                    throw error;
+            }
+        }
+        return decodeWithMediaCodec(sound.path);
     }
 
     // Linear interpolation to the voice rate.
@@ -5917,10 +6123,11 @@ Il2Cpp.perform(() => {
         const cached = soundboard.prepared.get(sound.path);
         if (cached)
             return cached;
-        const decoded = decodeWav(File.readAllBytes(sound.path));
+        const decoded = decodeSound(sound);
         const samples = resample(decoded.samples, decoded.rate, VOICE_SAMPLE_RATE);
         const cacheDirectory = `${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`;
         makeDirectories(cacheDirectory);
+        // horn.wav -> horn.wav, horn.mp3 -> horn.mp3.wav, so two formats of one name don't collide.
         const voicePath = `${cacheDirectory}/${sound.name.replace(/\.wav$/i, "")}.wav`;
         File.writeAllBytes(voicePath, encodeWav(makeLoud(samples, settings.soundBoost), VOICE_SAMPLE_RATE));
         let clip = NULL;
@@ -6059,7 +6266,7 @@ Il2Cpp.perform(() => {
             }),
         ];
         if (soundboard.sounds.length === 0)
-            entries.push(actionEntry("sounds-none", "No Sounds Found", () => log(`put .wav files in ${soundsDirectory()}`)));
+            entries.push(actionEntry("sounds-none", "No Sounds Found", () => log(`put audio files (.wav, .mp3, .ogg, .m4a...) in ${soundsDirectory()}`)));
         for (const sound of soundboard.sounds)
             entries.push(actionEntry(`sound-${sound.name}`, sound.label, () => playSound(sound)));
         return entries;
