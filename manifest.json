@@ -1,0 +1,16 @@
+{
+  "name": "Frida Scripts Repository",
+  "version": "1.0",
+  "presets": [
+    {
+      "title": "Big Ballers (Overdose Menu)",
+      "target": "com.dogelabs.bigballersbasketball",
+      "script": "bigballers/script/bigballers_script.js",
+      "bridge_mode": "embedded",
+      "custom_bridge": "",
+      "sounds": "bigballers/sounds",
+      "sounds_game_target": "/sdcard/Android/data/com.dogelabs.bigballersbasketball/files/Overdose/Sounds",
+      "eternalize": false
+    }
+  ]
+}
