@@ -216,6 +216,11 @@ Il2Cpp.perform(() => {
     // WAV is read directly; everything else goes through Android's own decoder (libmediandk).
     const SOUNDS_DIRECTORY = "Sounds";
     const SOUND_FILE_PATTERN = /\.(wav|mp3|ogg|oga|opus|m4a|aac|flac|amr|3gp|webm|mka)$/i;
+    // Converting a sound runs on the game thread, so it's done a few milliseconds per frame (the
+    // loops yield every SOUND_PREP_CHUNK samples) instead of freezing the game for a second.
+    const SOUND_PREP_SLICE_MS = 3;
+    const SOUND_PREP_CHUNK = 4096;
+    const SOUND_DECODE_TIMEOUT_MS = 60000;
     // Soundboard loudness: sounds are brought to full scale, then pushed this much louder with a
     // soft limiter. Vivox sends injected audio as-is, so quiet files come out much quieter than voice;
     // the top settings sound louder still but more distorted.
@@ -5715,6 +5720,7 @@ Il2Cpp.perform(() => {
         clipScope: [],
         vivox: undefined,
         media: undefined,
+        jobs: [],
     };
 
     const libcDirectory = {
@@ -5787,6 +5793,7 @@ Il2Cpp.perform(() => {
 
     // Converted sounds are made again on their next press (after a reload or a volume change).
     function forgetPreparedSounds() {
+        cancelSoundJobs();
         for (const prepared of soundboard.prepared.values())
             destroyObject(prepared.clip);
         soundboard.prepared.clear();
@@ -5797,12 +5804,13 @@ Il2Cpp.perform(() => {
         stopSounds(true);
         forgetPreparedSounds();
         const count = refreshSounds();
+        prefetchSounds();
         log(count > 0 ? `loaded ${count} sound(s)` : `no sounds found; put audio files (.wav, .mp3, .ogg, .m4a...) in ${soundsDirectory()}`);
     }
 
     // ─── WAV decoding ───
 
-    function decodeWav(buffer) {
+    function* decodeWavSteps(buffer) {
         const view = new DataView(buffer);
         const tag = (offset) => String.fromCharCode(...new Uint8Array(buffer, offset, 4));
         if (buffer.byteLength < 12 || tag(0) !== "RIFF" || tag(8) !== "WAVE")
@@ -5850,6 +5858,8 @@ Il2Cpp.perform(() => {
             for (let channel = 0; channel < format.channels; channel++)
                 sum += read(at + channel * bytes);
             mono[frame] = sum / format.channels;
+            if ((frame & (SOUND_PREP_CHUNK - 1)) === 0)
+                yield;
         }
         return { samples: mono, rate: format.rate, truncated: Math.floor(dataLength / frameBytes) > frames };
     }
@@ -5918,7 +5928,7 @@ Il2Cpp.perform(() => {
     const MEDIA_PCM_FLOAT = 4;
 
     // Decodes the first audio track to mono samples, like decodeWav.
-    function decodeWithMediaCodec(filePath) {
+    function* decodeWithMediaCodecSteps(filePath) {
         const media = mediaNatives();
         if (!media)
             throw new Error("this headset can't decode that format; use .wav");
@@ -5969,9 +5979,12 @@ Il2Cpp.perform(() => {
             let frames = 0;
             let truncated = false;
             let inputDone = false;
-            for (let spin = 0; spin < 100000; spin++) {
+            const giveUpAt = Date.now() + SOUND_DECODE_TIMEOUT_MS;
+            for (;;) {
+                if (Date.now() > giveUpAt)
+                    throw new Error("decoding took too long");
                 if (!inputDone) {
-                    const slot = toNumber(media.inputIndex(codec, 2000));
+                    const slot = toNumber(media.inputIndex(codec, 0));
                     if (slot >= 0) {
                         const buffer = media.inputBuffer(codec, slot, size);
                         const read = toNumber(media.readSample(extractor, buffer, size.readU64()));
@@ -5985,7 +5998,7 @@ Il2Cpp.perform(() => {
                         }
                     }
                 }
-                const output = toNumber(media.outputIndex(codec, info, 2000));
+                const output = toNumber(media.outputIndex(codec, info, 0));
                 if (output === MEDIA_FORMAT_CHANGED) {
                     const changed = media.outputFormat(codec);
                     rate = readInt(changed, media.keys.rate, rate);
@@ -5994,8 +6007,11 @@ Il2Cpp.perform(() => {
                     media.formatDelete(changed);
                     continue;
                 }
-                if (output < 0)
+                if (output < 0) {
+                    // The decoder works on its own threads; check back next slice.
+                    yield;
                     continue;
+                }
                 const offset = info.readS32();
                 const bytes = info.add(4).readS32();
                 const flags = info.add(16).readU32();
@@ -6012,6 +6028,7 @@ Il2Cpp.perform(() => {
                         mono[frame] = sum * scale / channels;
                     }
                     chunks.push(mono);
+                    yield;
                     frames += mono.length;
                     truncated = frames >= rate * SOUND_MAX_SECONDS;
                 }
@@ -6044,21 +6061,21 @@ Il2Cpp.perform(() => {
 
     // WAV is read directly; other formats, and WAVs in encodings decodeWav doesn't handle, go through
     // Android's decoder.
-    function decodeSound(sound) {
+    function* decodeSoundSteps(sound) {
         if (/\.wav$/i.test(sound.name)) {
             try {
-                return decodeWav(File.readAllBytes(sound.path));
+                return yield* decodeWavSteps(File.readAllBytes(sound.path));
             }
             catch (error) {
                 if (!mediaNatives())
                     throw error;
             }
         }
-        return decodeWithMediaCodec(sound.path);
+        return yield* decodeWithMediaCodecSteps(sound.path);
     }
 
     // Linear interpolation to the voice rate.
-    function resample(samples, fromRate, toRate) {
+    function* resampleSteps(samples, fromRate, toRate) {
         if (fromRate === toRate)
             return samples;
         const length = Math.max(1, Math.round(samples.length * toRate / fromRate));
@@ -6070,11 +6087,13 @@ Il2Cpp.perform(() => {
             const base = Math.min(Math.floor(position), last);
             const next = Math.min(base + 1, last);
             output[index] = samples[base] + (samples[next] - samples[base]) * (position - base);
+            if ((index & (SOUND_PREP_CHUNK - 1)) === 0)
+                yield;
         }
         return output;
     }
 
-    function encodeWav(samples, rate) {
+    function* encodeWavSteps(samples, rate) {
         const buffer = new ArrayBuffer(44 + samples.length * 2);
         const view = new DataView(buffer);
         const writeTag = (offset, text) => {
@@ -6094,24 +6113,33 @@ Il2Cpp.perform(() => {
         view.setUint16(34, 16, true);
         writeTag(36, "data");
         view.setUint32(40, samples.length * 2, true);
-        for (let index = 0; index < samples.length; index++)
+        for (let index = 0; index < samples.length; index++) {
             view.setInt16(44 + index * 2, Math.round(clamp(samples[index], -1, 1) * 32767), true);
+            if ((index & (SOUND_PREP_CHUNK - 1)) === 0)
+                yield;
+        }
         return buffer;
     }
 
     // Brings the loudest point to full scale, then pushes quieter parts up by `boost` through a
     // tanh soft limiter: louder without hard clipping. At 1x it's just normalized.
-    function makeLoud(samples, boost) {
+    function* makeLoudSteps(samples, boost) {
         let peak = 0;
-        for (const value of samples)
-            peak = Math.max(peak, Math.abs(value));
+        for (let index = 0; index < samples.length; index++) {
+            peak = Math.max(peak, Math.abs(samples[index]));
+            if ((index & (SOUND_PREP_CHUNK - 1)) === 0)
+                yield;
+        }
         if (peak < 1e-4)
             return samples;
         const gain = boost / peak;
         const scale = 0.98 / Math.tanh(boost);
         const output = new Float32Array(samples.length);
-        for (let index = 0; index < samples.length; index++)
+        for (let index = 0; index < samples.length; index++) {
             output[index] = Math.tanh(samples[index] * gain) * scale;
+            if ((index & (SOUND_PREP_CHUNK - 1)) === 0)
+                yield;
+        }
         return output;
     }
 
@@ -6119,17 +6147,15 @@ Il2Cpp.perform(() => {
 
     // Converted once per session: a boosted 48 kHz mono WAV for Vivox, and an AudioClip at the
     // file's own level for playing it on your headset (the Sound Volume boost is only for others).
-    function prepareSound(sound) {
-        const cached = soundboard.prepared.get(sound.path);
-        if (cached)
-            return cached;
-        const decoded = decodeSound(sound);
-        const samples = resample(decoded.samples, decoded.rate, VOICE_SAMPLE_RATE);
+    function* prepareSoundSteps(sound) {
+        const decoded = yield* decodeSoundSteps(sound);
+        const samples = yield* resampleSteps(decoded.samples, decoded.rate, VOICE_SAMPLE_RATE);
+        const voiceWav = yield* encodeWavSteps(yield* makeLoudSteps(samples, settings.soundBoost), VOICE_SAMPLE_RATE);
         const cacheDirectory = `${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`;
         makeDirectories(cacheDirectory);
         // horn.wav -> horn.wav, horn.mp3 -> horn.mp3.wav, so two formats of one name don't collide.
         const voicePath = `${cacheDirectory}/${sound.name.replace(/\.wav$/i, "")}.wav`;
-        File.writeAllBytes(voicePath, encodeWav(makeLoud(samples, settings.soundBoost), VOICE_SAMPLE_RATE));
+        File.writeAllBytes(voicePath, voiceWav);
         let clip = NULL;
         const scope = [];
         try {
@@ -6216,9 +6242,74 @@ Il2Cpp.perform(() => {
         return source;
     }
 
+    // Queues a sound for conversion; `play` moves it to the front and plays it once it's ready (only
+    // the latest press plays).
+    function queueSound(sound, play) {
+        let job = soundboard.jobs.find((queued) => queued.sound.path === sound.path);
+        if (!job) {
+            job = { sound, steps: prepareSoundSteps(sound), play: false };
+            soundboard.jobs.push(job);
+        }
+        if (play) {
+            for (const queued of soundboard.jobs)
+                queued.play = false;
+            job.play = true;
+            soundboard.jobs.splice(soundboard.jobs.indexOf(job), 1);
+            soundboard.jobs.unshift(job);
+        }
+    }
+
+    // Opening the Sounds page gets every sound converted in the background, so presses are instant.
+    function prefetchSounds() {
+        for (const sound of soundboard.sounds) {
+            if (!soundboard.prepared.has(sound.path))
+                queueSound(sound, false);
+        }
+    }
+
+    function cancelSoundJobs() {
+        for (const job of soundboard.jobs) {
+            try {
+                job.steps.return();
+            }
+            catch (_) { }
+        }
+        soundboard.jobs = [];
+    }
+
+    function updateSoundJobs() {
+        if (soundboard.jobs.length === 0)
+            return;
+        const deadline = Date.now() + SOUND_PREP_SLICE_MS;
+        while (soundboard.jobs.length > 0 && Date.now() < deadline) {
+            const job = soundboard.jobs[0];
+            let step;
+            try {
+                step = job.steps.next();
+            }
+            catch (error) {
+                soundboard.jobs.shift();
+                log(`couldn't ${job.play ? "play" : "load"} ${job.sound.label}: ${describeError(error)}`);
+                continue;
+            }
+            if (!step.done)
+                continue;
+            soundboard.jobs.shift();
+            if (job.play)
+                startSound(job.sound, step.value);
+        }
+    }
+
     function playSound(sound) {
+        const prepared = soundboard.prepared.get(sound.path);
+        if (prepared)
+            startSound(sound, prepared);
+        else
+            queueSound(sound, true);
+    }
+
+    function startSound(sound, prepared) {
         try {
-            const prepared = prepareSound(sound);
             const sent = injectVoice(INJECTION_RESTART, prepared.voicePath);
             if (unityAlive(soundboard.source))
                 A.stop(soundboard.source);
@@ -6437,8 +6528,10 @@ Il2Cpp.perform(() => {
         menu.page = 0;
         if (category === "Titles")
             log(`loaded ${refreshTitleCatalog()} title buttons`);
-        else if (category === "Sounds")
+        else if (category === "Sounds") {
             refreshSounds();
+            prefetchSounds();
+        }
     }
 
     function goBack() {
@@ -7081,6 +7174,7 @@ Il2Cpp.perform(() => {
         ["gold explosion", updateGoldExplosion],
         ["titles", updateTitleKeeper],
         ["custom name", updateCustomName],
+        ["soundboard", updateSoundJobs],
         ["ball orbit", updateBallOrbit],
         ["ball stack", updateBallStack],
         ["grip spawn", updateGripSpawn],
