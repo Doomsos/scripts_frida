@@ -1,25 +1,10 @@
-// Overdose — mod menu for Big Ballers (Overdose default-style layout, Red theme).
-//
-// Loaded after the embedded frida-il2cpp-bridge. Everything lives inside Il2Cpp.perform, so nothing
-// here collides with the globals a bridge bundle defines. Boot only resolves metadata and installs
-// hooks; every Unity call happens on the game's main thread inside the HeightController.Update tick.
-//
-// Hot paths call IL2CPP through cached native functions and raw field offsets. The bridge's
-// obj.method()/obj.field() re-resolve the member and build a new NativeFunction on every call,
-// which is what used to drag the frame rate down.
 Il2Cpp.perform(() => {
     "use strict";
 
-    // ───────────────────────────────────── Config ─────────────────────────────────────
-
     const MENU_TITLE = "Overdose Menu";
-    // Names of the objects this script adds to the scene; a reload removes any left over by the
-    // previous copy.
     const SCENE_OBJECT_NAMES = ["OverdoseMenu", "OverdosePointer", "OverdoseBallMarker", "OverdoseBallTracer", "OverdosePlayerTracer", "OverdoseSoundboard"];
     const LOCKER_DEBUG = false;
 
-    // Menu placement: the Overdose layout, tilted and pushed off the left hand the way the
-    // previous menu was, so it shows up where it used to.
     const MENU_LAYER = 31;
     const MENU_SIZE = 1.0;
     const MENU_HAND_TILT = [-45, 0, 0];
@@ -35,7 +20,6 @@ Il2Cpp.perform(() => {
     const CLICK_ANIMATION_SECONDS = 0.1;
     const CLICK_ANIMATION_SCALE = 0.95;
 
-    // Tick pacing
     const TICK_DEDUP_SECONDS = 0.002;
     const REFERENCE_REFRESH_SECONDS = 0.5;
     const LOCAL_MODEL_REFRESH_SECONDS = 1.0;
@@ -43,16 +27,13 @@ Il2Cpp.perform(() => {
     const CAMERA_FIX_SECONDS = 3.0;
     const LOCKER_UI_CHECK_SECONDS = 0.25;
     const BALL_LIST_REFRESH_SECONDS = 0.25;
-    // Balls that belong to the map aren't in BallController's pool; a slower scene scan finds them.
     const BALL_SCENE_SCAN_SECONDS = 2.0;
 
-    // Movement
     const FLY_SPEED = 8.0;
     const SPEED_BOOST_MULTIPLIER = 2.25;
     const JUMP_BOOST_MULTIPLIER = 2.5;
     const MOVEMENT_REFRESH_SECONDS = 1.0;
 
-    // Player size
     const SCALE_PRESETS = [
         { label: "Normal (1.0x)", multiplier: 1.0 },
         { label: "Tall (1.4x)", multiplier: 1.4 },
@@ -69,7 +50,6 @@ Il2Cpp.perform(() => {
     const DEFAULT_PLAYER_HEIGHT = 1.82;
     const PLAYER_SCALE_REFRESH_SECONDS = 0.25;
 
-    // Shooting
     const SHOOT_BOOST_DEFAULT = 200;
     const SHOOT_BOOST_MIN = 50;
     const SHOOT_BOOST_MAX = 500;
@@ -80,9 +60,6 @@ Il2Cpp.perform(() => {
     const AUTO_AIM_TIME_BASE = 0.72;
     const AUTO_AIM_METERS_PER_SECOND = 24.0;
     const AUTO_AIM_GATE_DROP_SPEED = 3.25;
-    // Swish shots come down through the center of the rim at the Shot Arc angle, so the arc scores on
-    // its own even if the in-flight guidance never gets to run (server lag, ownership still on its
-    // way). Steeper is more forgiving: 45 degrees leaves ~10 cm of room, 55 ~14 cm, 65+ ~17 cm.
     const AUTO_AIM_ARC_CHOICES = [
         { degrees: 45, label: "Low" },
         { degrees: 55, label: "Normal" },
@@ -92,12 +69,8 @@ Il2Cpp.perform(() => {
     ];
     const AUTO_AIM_ARC_DEFAULT = 55;
     const AUTO_AIM_ENTRY_HEIGHT = 0.0;
-    // In flight, a swish shot is re-aimed at the rim center whenever it would cross it more than
-    // AUTO_AIM_HOMING_TOLERANCE off, so it drops straight in instead of clipping the rim.
     const AUTO_AIM_HOMING_INTERVAL = 0.05;
     const AUTO_AIM_HOMING_TOLERANCE = 0.03;
-    // While a shot is ours it's held to the planned arc: anything that knocks it off (the game's own
-    // throw velocity landing late, a laggy correction) gets steered back.
     const AUTO_AIM_PATH_TOLERANCE = 0.25;
     const AUTO_AIM_VELOCITY_TOLERANCE = 1.5;
     const AUTO_AIM_PATH_GAIN = 5.0;
@@ -106,8 +79,6 @@ Il2Cpp.perform(() => {
     const HOOP_CACHE_SECONDS = 5.0;
     const POINTS_PER_SHOT_CHOICES = [1, 2, 4, 6, 8, 10, 12];
 
-    // Ball orbit. Balls are steered with rigidbody velocity so Normcore keeps interpolating them for
-    // everyone; ownership is requested at most once per second per ball and never for held balls.
     const ORBIT_RADIUS = 1.75;
     const ORBIT_ANGULAR_SPEED = 2.8;
     const ORBIT_HEIGHT = -0.15;
@@ -120,7 +91,6 @@ Il2Cpp.perform(() => {
     const ORBIT_OWNERSHIP_RETRY_SECONDS = 1.0;
     const ORBIT_RELEASE_GRACE_SECONDS = 3.0;
 
-    // Ball stack: balls held in spinning rings above your head, fired at the hoop while RT is held.
     const BALL_STACK_HEIGHT = 0.75;
     const BALL_STACK_RADIUS = 0.42;
     const BALL_STACK_LAYER_SPACING = 0.34;
@@ -128,22 +98,16 @@ Il2Cpp.perform(() => {
     const BALL_STACK_SPIN = 1.2;
     const BALL_STACK_TRIGGER_THRESHOLD = 0.55;
     const BALL_STACK_FIRE_INTERVAL_SECONDS = 0.15;
-    // The stack only fires at a hoop within this angle of where you're looking.
     const BALL_STACK_AIM_CONE_DEGREES = 40;
 
-    // Grip spawn: a grip that hasn't picked anything up after this long spawns a ball into the hand.
     const GRIP_SPAWN_DELAY_SECONDS = 0.12;
     const GRIP_SPAWN_GRAB_DISTANCE = 0.6;
     const GRIP_SPAWN_DEFAULT_THRESHOLD = 0.6;
 
-    // Score effects
     const RAINBOW_VFX_UPDATE_SECONDS = 0.04;
     const RAINBOW_VFX_HUE_CYCLES_PER_SECOND = 1.8;
     const GOLD_EXPLOSION_SKU = 100281;
     const GOLD_EXPLOSION_REFRESH_SECONDS = 0.75;
-    // Room clients instantiate their own full score-effect prefabs, so sender-side particle caps
-    // cannot protect other headsets. The catalog goes out through the game's normal synchronized
-    // VFX path at a steady cadence, which also keeps Normcore from coalescing the updates.
     const ALL_SCORE_EFFECT_SKUS = [
         100278, 100279, 100280, 100281, 100282, 100298, 100311, 100312, 100314, 100320,
         100326, 100327, 100328, 100329, 100337, 100344, 100357, 100389, 100396, 100399,
@@ -162,15 +126,12 @@ Il2Cpp.perform(() => {
     const ALL_SCORE_EFFECTS_STOP_GRACE_SECONDS = 1.0;
     const ALL_SCORE_EFFECTS_CLEANUP_INTERVAL_SECONDS = 0.10;
 
-    // Visuals
     const VISUAL_RESCAN_SECONDS = 0.50;
     const VISUAL_UPDATE_SECONDS = 1 / 30;
     const VISUAL_MAX_PLAYERS = 24;
     const VISUAL_MAX_BALLS = 32;
 
-    // Exploits
     const HOOP_HITBOX_RESCAN_SECONDS = 1.0;
-    // How much wider the scoring box gets; it also grows a little taller as it widens.
     const HOOP_HITBOX_CHOICES = [
         { width: 2, height: 1.25 },
         { width: 4, height: 1.5 },
@@ -179,9 +140,7 @@ Il2Cpp.perform(() => {
         { width: 32, height: 4.0 },
     ];
     const HOOP_HITBOX_DEFAULT = 4;
-    // Steal ball: RT takes the first ball your right hand's pointer ray passes through, like a
-    // raycast: the ray "hits" a ball it passes within STEAL_BALL_RAY_RADIUS (+ a little per meter)
-    // of, and the nearest hit wins. If it hits nothing, the ball closest to the ray within the cone.
+    const OWNERSHIP_SPAM_REPEATS = 10;
     const STEAL_BALL_TRIGGER_THRESHOLD = 0.55;
     const STEAL_BALL_RAY_RADIUS = 0.35;
     const STEAL_BALL_RAY_RADIUS_PER_METER = 0.03;
@@ -191,7 +150,6 @@ Il2Cpp.perform(() => {
     const STEAL_BALL_OWNERSHIP_RETRY_SECONDS = 0.3;
     const STEAL_BALL_SLAP_RETRY_SECONDS = 0.6;
 
-    // Progression, titles and unlock-all
     const LEVEL_INCREASE_CHOICES = [10, 20, 50, 100, 150, 200, 500];
     const LEVEL_ACTION_COOLDOWN_SECONDS = 1.0;
     const SESSION_LEVEL_REFRESH_SECONDS = 0.75;
@@ -200,37 +158,26 @@ Il2Cpp.perform(() => {
     const DEVELOPER_TITLE_SKU = 100269;
     const TITLE_ITEM_TYPE = 24;
     const SCORE_VFX_ITEM_TYPE = 27;
-    // After a spawn the game loads your outfit itself; the saved one is checked once that's done.
     const OUTFIT_SETTLE_SECONDS = 2.0;
     const OUTFIT_REAPPLY_SECONDS = 0.5;
     const OUTFIT_REAPPLY_BURST = 6;
     const OUTFIT_MAX_ATTEMPTS = 3;
 
-    // Config file: <game storage>/Overdose/config.json
     const CONFIG_DIRECTORY = "Overdose";
     const CONFIG_FILE = "config.json";
     const CONFIG_VERSION = 1;
     const CONFIG_SAVE_DELAY_SECONDS = 0.5;
     const LOG_FILE = "log.txt";
-    // Soundboard: audio files go in Overdose/Sounds; their voice-chat copies live in the cache.
-    // WAV is read directly; everything else goes through Android's own decoder (libmediandk).
     const SOUNDS_DIRECTORY = "Sounds";
     const SOUND_FILE_PATTERN = /\.(wav|mp3|ogg|oga|opus|m4a|aac|flac|amr|3gp|webm|mka)$/i;
-    // Converting a sound runs on the game thread, so it's done a few milliseconds per frame (the
-    // loops yield every SOUND_PREP_CHUNK samples) instead of freezing the game for a second.
     const SOUND_PREP_SLICE_MS = 3;
-    // While a pressed sound is waiting to play, it gets a bigger slice.
     const SOUND_PREP_PRESSED_SLICE_MS = 8;
     const SOUND_PREP_CHUNK = 4096;
     const SOUND_DECODE_TIMEOUT_MS = 60000;
-    // Soundboard loudness: sounds are brought to full scale, then pushed this much louder with a
-    // soft limiter. Vivox sends injected audio as-is, so quiet files come out much quieter than voice;
-    // the top settings sound louder still but more distorted.
     const SOUND_BOOST_CHOICES = [1, 2, 3, 4, 6, 8, 10];
     const SOUND_BOOST_DEFAULT = 3;
     const SOUND_CACHE_DIRECTORY = ".soundcache";
     const PREVIOUS_LOG_FILE = "log.prev.txt";
-    // PlayerPrefs keys from earlier versions, newest first; read once to seed the config file.
     const LEGACY_PREF_KEYS = {
         outfit: ["Overdose.UnlockAll.LockerItems.v1", "BigBallersMenu.UnlockAll.LockerItems.v1"],
         unlockAll: ["Overdose.UnlockAll.Enabled.v1", "Overdose.UnlockDevItems.Enabled.v1"],
@@ -238,13 +185,9 @@ Il2Cpp.perform(() => {
         aimGuide: ["Overdose.AutoAimLegit.v1", "BigBallersMenu.AutoAimLegit.v1"],
     };
 
-    // ──────────────────────────────── Theme (Overdose "Red") ────────────────────────────────
-
     const rgb = (r, g, b) => [r / 255, g / 255, b / 255, 1];
     const shade = (color, factor) => [color[0] * factor, color[1] * factor, color[2] * factor, color[3]];
 
-    // Overdose Menu.ColorTable[0] ("Red"): menu, disabled and enabled colors; the pointer uses the
-    // menu color like Overdose's reference sphere.
     const THEME = {
         panel: rgb(235, 140, 140),
         button: rgb(210, 115, 115),
@@ -256,8 +199,6 @@ Il2Cpp.perform(() => {
         outlineWidth: 0.0015,
     };
 
-    // Overdose DefaultStyle geometry in menu-local meters. X points toward the viewer, Y runs to
-    // the viewer's left and Z is up.
     const LAYOUT = {
         panel: { center: [0.04774, 0, -0.0016], size: [0.0054792, 0.27, 0.36] },
         title: { center: [0.0508, 0, 0.161], size: [0.2, 0.03] },
@@ -284,8 +225,6 @@ Il2Cpp.perform(() => {
         page: { y: 0.0676, z: -0.1602, size: [0.009, 0.12, 0.032], textSize: [0.1, 0.022] },
     };
 
-    // ─────────────────────────────────────── Math ───────────────────────────────────────
-
     const DEG = Math.PI / 180;
     const IDENTITY = [0, 0, 0, 1];
     const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
@@ -305,7 +244,6 @@ Il2Cpp.perform(() => {
         ];
     }
 
-    // Matches UnityEngine.Quaternion.Euler: z, then x, then y.
     function quatFromEuler(x, y, z) {
         const qx = [Math.sin(x * DEG / 2), 0, 0, Math.cos(x * DEG / 2)];
         const qy = [0, Math.sin(y * DEG / 2), 0, Math.cos(y * DEG / 2)];
@@ -334,12 +272,8 @@ Il2Cpp.perform(() => {
     const MENU_TILT_ROTATION = quatFromEuler(MENU_HAND_TILT[0], MENU_HAND_TILT[1], MENU_HAND_TILT[2]);
     const RAIL_ROTATION = quatFromEuler(0, 0, LAYOUT.rail.tilt);
 
-    // ──────────────────────────────────── Runtime core ────────────────────────────────────
-
     const clock = () => Date.now() / 1000;
 
-    // Also written to Overdose/log.txt once the config folder is known (see openLogFile), so the
-    // lines before a crash can be read afterwards.
     const logSink = { file: null };
 
     function log(message) {
@@ -372,7 +306,6 @@ Il2Cpp.perform(() => {
         log(message);
     }
 
-    // The locker hooks are chatty; their step-by-step trace only prints with LOCKER_DEBUG.
     function lockerLog(message) {
         if (LOCKER_DEBUG)
             log(message);
@@ -419,9 +352,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Binds a method to its memoized NativeFunction. Callers pass raw values: pointers (or anything
-    // with a .handle), numbers, 0/1 for bools and [x, y, z] arrays for structs. Struct returns come
-    // back as arrays and object returns as NativePointers.
     function bind(klass, name, argc, types) {
         const method = findMethod(klass, name, argc, types);
         const label = `${klass ? klass.name : "?"}.${name}`;
@@ -433,8 +363,6 @@ Il2Cpp.perform(() => {
             return missing;
         }
         const native = method.nativeFunction;
-        // Methods of generic classes (e.g. RealtimeComponent<T>) take their MethodInfo* as a
-        // trailing hidden argument.
         const hidden = method.isInflated ? [method.handle] : [];
         const call = method.isStatic
             ? (...args) => native(...args, ...hidden)
@@ -443,8 +371,6 @@ Il2Cpp.perform(() => {
         return call;
     }
 
-    // Replaces a method through the bridge. makeImplementation receives the original as
-    // (self, ...args) for instance methods or (...args) for static ones.
     function hookMethod(klass, name, argc, types, makeImplementation) {
         const method = findMethod(klass, name, argc, types);
         if (!method) {
@@ -475,8 +401,6 @@ Il2Cpp.perform(() => {
         return !a.isNull() && a.equals(toPointer(right));
     }
 
-    // UnityEngine.Object wrappers outlive their native objects across map unloads; m_CachedPtr is
-    // what Object.op_Implicit checks.
     let cachedPtrOffset = 0x10;
     function unityAlive(value) {
         const pointer = toPointer(value);
@@ -502,7 +426,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Offsets for fields of whatever class the object really is, cached per class.
     const runtimeOffsets = new Map();
     function runtimeFieldOffset(objectPointer, name) {
         const klass = new Il2Cpp.Object(toPointer(objectPointer)).class;
@@ -547,8 +470,6 @@ Il2Cpp.perform(() => {
         };
     }
 
-    // Constant strings (labels, keys, property names) are allocated once and pinned, so no call
-    // allocates a managed string per frame and none can be collected mid-call.
     const managedStrings = new Map();
     function managed(text) {
         const value = String(text);
@@ -577,11 +498,6 @@ Il2Cpp.perform(() => {
     const pinObject = (value) => new Il2Cpp.Object(toPointer(value)).ref(true);
     const describeError = (error) => (error && error.stack) ? error.stack : String(error);
 
-    // Unity only holds the managed wrappers of engine objects weakly, and nothing managed points at
-    // the objects this script creates, so a garbage collection can reclaim a wrapper we still hold;
-    // the next call through it then touches freed memory (an access violation at a garbage address).
-    // Wrappers held across frames are pinned in a scope, a plain array of GC handles that is released
-    // together when its owner goes away.
     function keep(scope, value) {
         const pointer = toPointer(value);
         if (!pointer.isNull())
@@ -604,8 +520,6 @@ Il2Cpp.perform(() => {
         return pointer.isNull() ? 0 : pointer.add(arrayHeaderSize - Process.pointerSize).readU32();
     }
 
-    // Result arrays (FindObjectsOfType, GetComponentsInChildren, ...) are referenced by nothing else,
-    // so they stay pinned while their elements are read.
     function arrayItems(arrayPointer, limit = Infinity) {
         const pointer = toPointer(arrayPointer);
         const items = [];
@@ -655,8 +569,6 @@ Il2Cpp.perform(() => {
         }
         return pointer;
     }
-
-    // ──────────────────────────────────── Unity bindings ────────────────────────────────────
 
     const images = {
         core: openImage("UnityEngine.CoreModule"),
@@ -844,8 +756,6 @@ Il2Cpp.perform(() => {
         hash: findMethod(Unity.Scene, "GetHashCode", 0),
     };
 
-    // ─────────────────────────────────── Unity helpers ───────────────────────────────────
-
     const HIDE_DONT_UNLOAD = 32;
     const PRIMITIVE_SPHERE = 0;
 
@@ -925,10 +835,6 @@ Il2Cpp.perform(() => {
         return { ...object, renderer };
     }
 
-    // ──────────────────────────────────── Materials ────────────────────────────────────
-
-    // Flat colors need an unlit shader. URP/Unlit is preferred; Internal-Colored (the default line
-    // material's shader) and the old lit/sprite paths are fallbacks.
     const FLAT_SHADER_CANDIDATES = [
         ["Universal Render Pipeline/Unlit", "unlit"],
         ["Hidden/Internal-Colored", "colored"],
@@ -1073,8 +979,6 @@ Il2Cpp.perform(() => {
         return material;
     }
 
-    // ───────────────────────────────────── Meshes ─────────────────────────────────────
-
     function newValueArray(klass, count, stride, write) {
         const array = Il2Cpp.array(klass, count);
         let cursor = array.handle.add(arrayHeaderSize);
@@ -1096,7 +1000,6 @@ Il2Cpp.perform(() => {
                 cursor.add(8).writeFloat(vertices[index][2]);
             });
             U.meshSetVertices(mesh, vertexArray.pointer);
-            // White vertex colors: vertex-colored fallback shaders multiply by them.
             const colorArray = newValueArray(Unity.Color, vertices.length, 16, (cursor) => {
                 cursor.writeFloat(1);
                 cursor.add(4).writeFloat(1);
@@ -1125,7 +1028,6 @@ Il2Cpp.perform(() => {
         return { pointer: mesh, handle };
     }
 
-    // Convex outlines in the Y/Z plane, extruded along X from -0.5 to 0.5.
     function extrudeOutlines(outlines) {
         const vertices = [];
         const triangles = [];
@@ -1194,7 +1096,6 @@ Il2Cpp.perform(() => {
         });
     }
 
-    // Side-rail icons, drawn as meshes so they don't depend on the game's fonts.
     const bar = (z) => [[-0.45, z - 0.08], [0.45, z - 0.08], [0.45, z + 0.08], [-0.45, z + 0.08]];
     const ICONS = {
         home: [[[-0.42, -0.45], [0.42, -0.45], [0.42, 0.05], [0, 0.46], [-0.42, 0.05]]],
@@ -1203,8 +1104,6 @@ Il2Cpp.perform(() => {
     };
 
     const iconMesh = (name) => cachedMesh(`icon:${name}`, () => extrudeOutlines(ICONS[name]));
-
-    // ──────────────────────────────────────── Text ────────────────────────────────────────
 
     let fontPointer = NULL;
     let fontHandle = null;
@@ -1306,8 +1205,6 @@ Il2Cpp.perform(() => {
             log(`menu layer enabled on ${fixed} camera(s)`);
     }
 
-    // ──────────────────────────────────── Game bindings ────────────────────────────────────
-
     const Game = {
         HandManager: requireClass(images.game, "HandManager"),
         HeightController: requireClass(images.game, "HeightController"),
@@ -1321,7 +1218,6 @@ Il2Cpp.perform(() => {
         NCNetworkPlayer: requireClass(images.game, "NCNetworkPlayer"),
         NCNetworkPlayerData: findClass(images.game, "NCNetworkPlayerData"),
         NCNetworkPlayerDataController: findClass(images.game, "NCNetworkPlayerDataController"),
-        DLDisplayName: findClass(images.game, "DLDisplayName"),
         PlayerSync: findClass(images.game, "PlayerSync"),
         PlayerModel: findClass(images.game, "PlayerModel") ?? findClass(images.extra, "PlayerModel"),
         IAPItemSO: requireClass(images.game, "IAPItemSO"),
@@ -1341,9 +1237,6 @@ Il2Cpp.perform(() => {
     };
 
     const OFF = {
-        playerSync: {
-            publishedRoomId: fieldOffset(Game.PlayerSync, "_publishedRoomId"),
-        },
         hand: {
             left: fieldOffset(Game.HandManager, "HandL"),
             right: fieldOffset(Game.HandManager, "HandR"),
@@ -1401,8 +1294,6 @@ Il2Cpp.perform(() => {
         networkPlayer: { headTrack: fieldOffset(Game.NCNetworkPlayer, "HeadTrack") },
         vfxSync: {
             lock: fieldOffset(Game.VFXSync, "lockVFXTrigger"),
-            // RealtimeComponent<VFXModel>.model is protected; its backing field says whether the
-            // component is connected to the room.
             model: fieldOffset(Game.VFXSync, "<model>k__BackingField"),
         },
         vfxEvent: { item: fieldOffset(Game.VFXEvent, "iapVFX") },
@@ -1456,9 +1347,6 @@ Il2Cpp.perform(() => {
         playerDataIsReplay: bind(Game.NCNetworkPlayerData, "get_IsReplayMannequin", 0),
         playerDataModel: bind(Game.NCNetworkPlayerData, "GetPlayerModel", 0),
         playerDataSync: bind(Game.NCNetworkPlayerData, "GetPlayerSync", 0),
-        publishIdentity: bind(Game.PlayerSync, "PublishLocalIdentity", 0),
-        sanitizeName: bind(Game.DLDisplayName, "Sanitize", 1),
-        nameHasEmoji: bind(Game.DLDisplayName, "ContainsEmoji", 1),
         modelHeight: bind(Game.PlayerModel, "get_playerHeight", 0),
         modelSetHeight: bind(Game.PlayerModel, "set_playerHeight", 1),
         modelVfxScore: bind(Game.PlayerModel, "get_vfxScore", 0),
@@ -1474,8 +1362,6 @@ Il2Cpp.perform(() => {
         saveLocalCustomization: bind(Game.IAPItemSO, "SaveLocalCustomization", 2),
         playVfxSynced: bind(Game.VFXSync, "PlayVFXSynced", 2),
     };
-
-    // ──────────────────────────────────── Game references ────────────────────────────────────
 
     const refs = {
         handManager: NULL,
@@ -1495,7 +1381,6 @@ Il2Cpp.perform(() => {
         localModel: NULL,
         nextRefresh: 0,
         nextModelRefresh: 0,
-        // The camera transform comes from a getter rather than a game field, so it's pinned here.
         cameraScope: [],
     };
 
@@ -1521,7 +1406,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // PlayerModel is a RealtimeModel, not a UnityEngine.Object, so only null is checked.
     function localPlayerModel() {
         const data = localPlayerData();
         if (data.isNull())
@@ -1630,8 +1514,6 @@ Il2Cpp.perform(() => {
         return null;
     }
 
-    // ─────────────────────────────────────── Input ───────────────────────────────────────
-
     const input = { menu: false, leftTrigger: 0, rightTrigger: 0, leftGrip: 0, rightGrip: 0 };
     const xrValue = Memory.alloc(1);
 
@@ -1647,8 +1529,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // BNG's InputBridge is read straight from memory. The left primary button also goes through
-    // XR, exactly like the previous menu, so the menu opens even if the bridge isn't up yet.
     function readInput() {
         const bridge = refs.inputBridge;
         if (unityAlive(bridge)) {
@@ -1680,8 +1560,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Scenes ───────────────────────────────────────
-
     let activeScene = { name: "", token: "" };
     let nextSceneCheck = 0;
 
@@ -1702,10 +1580,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Balls ───────────────────────────────────────
-
-    // One shared, throttled view of every ball for orbit, visuals and aim: BallController's pool
-    // (balls with isPooled set) plus the balls that belong to the map, found by a slower scene scan.
     const ballList = { entries: [], nextRefresh: 0, sceneBalls: [], nextSceneScan: 0 };
 
     function trackedBalls(now) {
@@ -1752,8 +1626,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ──────────────────────────────────── State ────────────────────────────────────
-
     const toggles = {
         fly: false,
         speedBoost: false,
@@ -1772,22 +1644,20 @@ Il2Cpp.perform(() => {
         playerTracers: false,
         ballTracers: false,
         increaseHoopHitbox: false,
-        customName: false,
+        ownershipSpam: false,
         bigBoy: false,
     };
 
     const settings = {
         shootBoostPercent: SHOOT_BOOST_DEFAULT,
         pointsPerShot: 1,
-        autoAimMode: 0, // 0 = Swish, 1 = Bank Shot
-        autoAimLegit: 0, // 0 = Snap & Drop, 1 = Smooth Glide (bank shots, after the board)
+        autoAimMode: 0,
+        autoAimLegit: 0,
         shotArc: AUTO_AIM_ARC_DEFAULT,
         hoopHitbox: HOOP_HITBOX_DEFAULT,
         soundBoost: SOUND_BOOST_DEFAULT,
-        hearSounds: true, // soundboard sounds also play on your headset
+        hearSounds: true,
     };
-
-    // ──────────────────────────────── Movement & fly ────────────────────────────────
 
     const movement = {
         applied: false,
@@ -1883,93 +1753,6 @@ Il2Cpp.perform(() => {
         ]);
     }
 
-    // ───────────────────────────────── Custom name ─────────────────────────────────
-
-    // The game shows the local player's name from PlayerSync.LockSessionUsername, and
-    // PublishLocalIdentity puts that same name into the identity token everyone else reads
-    // (DLIdentityCodec: "version|userId|...|name"). Other players' games check that token and report
-    // a malformed one, or one with emoji, as tampering, so the name only goes in through the game's
-    // own path: the hook hands LockSessionUsername our name (cleaned by the game's own
-    // DLDisplayName.Sanitize), and the identity is published again whenever the name changes.
-    const CUSTOM_NAME_MAX_LENGTH = 24;
-    const CUSTOM_NAME_FALLBACK = "Baller";
-    const customName = {
-        desired: "",
-        checkedFrom: null,
-        clean: null,
-        sync: NULL,
-        published: null,
-        nextRefresh: 0,
-    };
-
-    // The name as the game will show it, or null to keep the player's own.
-    function customNameValue() {
-        if (!toggles.customName || !customName.desired)
-            return null;
-        if (customName.checkedFrom !== customName.desired) {
-            customName.checkedFrom = customName.desired;
-            customName.clean = null;
-            try {
-                const cleaned = readString(G.sanitizeName(managed(customName.desired.slice(0, CUSTOM_NAME_MAX_LENGTH))));
-                if (!cleaned || (cleaned === CUSTOM_NAME_FALLBACK && customName.desired !== CUSTOM_NAME_FALLBACK))
-                    log(`custom name "${customName.desired}" isn't a name the game accepts; keeping your own`);
-                else if (G.nameHasEmoji(managed(cleaned)))
-                    log(`custom name "${customName.desired}" has emoji, which other players' games report as tampering; keeping your own`);
-                else
-                    customName.clean = cleaned;
-            }
-            catch (error) {
-                log(`custom name check failed: ${error}`);
-            }
-        }
-        return customName.clean;
-    }
-
-    function installCustomNameHook() {
-        if (!Game.PlayerSync)
-            return;
-        // Only reached for the local player (display and identity publishing).
-        hookMethod(Game.PlayerSync, "LockSessionUsername", 0, null, (original) => function () {
-            const name = customNameValue();
-            return name === null ? original(this) : managed(name);
-        });
-    }
-
-    function updateCustomName(now) {
-        if (now < customName.nextRefresh)
-            return;
-        customName.nextRefresh = now + 1.0;
-        const sync = localPlayerSync();
-        if (sync.isNull())
-            return;
-        const wanted = customNameValue() ?? "";
-        if (!sameObject(sync, customName.sync)) {
-            // A new PlayerSync (lobby, or the script starting mid-lobby) has the player's own name
-            // published unless the game already went through the hook.
-            customName.sync = sync;
-            customName.published = "";
-        }
-        if (customName.published === wanted)
-            return;
-        try {
-            // PublishLocalIdentity skips a room it already published in; forgetting the room id
-            // makes it issue a fresh identity with the new name.
-            if (OFF.playerSync.publishedRoomId >= 0)
-                toPointer(sync).add(OFF.playerSync.publishedRoomId).writePointer(NULL);
-            G.publishIdentity(sync);
-            customName.published = wanted;
-            log(wanted ? `name set to ${wanted}` : "custom name off; using your own name");
-        }
-        catch (error) {
-            logThrottled("custom-name", 10, `custom name update failed: ${error}`);
-        }
-    }
-
-    // ───────────────────────────────── Player size ─────────────────────────────────
-
-    // HeightController.playerHeight is what the game syncs as the player's height; MeasureStandingHeight
-    // and ComputeCredibleHeight feed its periodic recalibration, and PlayerModel.playerHeight is the
-    // networked copy. Only the local player's model is touched, so other players keep their size.
     const playerScale = {
         mode: 0,
         baseHeight: DEFAULT_PLAYER_HEIGHT,
@@ -2011,7 +1794,6 @@ Il2Cpp.perform(() => {
         }
         if (force || playerScale.lastApplied !== multiplier) {
             const scale = [multiplier, multiplier, multiplier];
-            // The tracking space scales the view and hands; the player root scales the local body.
             try {
                 const rig = U.parent(refs.camera);
                 if (unityAlive(rig))
@@ -2062,8 +1844,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────── Auto aim & shoot boost ───────────────────────────────
-
     const autoAim = {
         guided: [],
         guidedKeys: new Set(),
@@ -2072,7 +1852,6 @@ Il2Cpp.perform(() => {
         nextHoopScan: 0,
         basketballs: new Map(),
     };
-    // When the local player last released each ball; orbit leaves fresh shots alone.
     const recentReleases = new Map();
 
     function clearGuidedBalls() {
@@ -2204,13 +1983,11 @@ Il2Cpp.perform(() => {
         let heightOffset;
         let jitter = [0, 0, 0];
         if (shooterDistance >= 1.6) {
-            // Standard bank range: aim flat, compensating for distance without sky-arcing.
             horizontalOffset = side * (0.37 + Math.min(5.0, shooterDistance) * 0.022);
             heightOffset = 0.39 + Math.min(6.5, shooterDistance) * 0.018;
             jitter = [(Math.random() - 0.5) * 0.10, (Math.random() - 0.5) * 0.06, (Math.random() - 0.5) * 0.10];
         }
         else {
-            // Layup touch off the glass: aim low and skip jitter so it always converts.
             horizontalOffset = side * 0.18;
             heightOffset = 0.12 + shooterDistance * 0.15;
         }
@@ -2246,7 +2023,6 @@ Il2Cpp.perform(() => {
         return { gravity, damping, step };
     }
 
-    // Where a ball launched from `start` at `velocity` is, and how fast it's going, `time` seconds later.
     function ballisticState(start, velocity, { gravity, damping }, time) {
         if (damping < 0.0001) {
             return {
@@ -2264,7 +2040,6 @@ Il2Cpp.perform(() => {
         };
     }
 
-    // The flight time that brings the ball down into `target` at `degrees` below horizontal.
     function steepArcTime(start, target, gravity, degrees) {
         const g = Math.max(1, Math.hypot(gravity[0], gravity[1], gravity[2]));
         const horizontal = Math.hypot(target[0] - start[0], target[2] - start[2]);
@@ -2295,8 +2070,6 @@ Il2Cpp.perform(() => {
             return cached;
         let result = false;
         try {
-            // VRExperience declares its own `name` field; Object.get_name does not reliably
-            // identify free-play balls.
             const data = readPointerAt(ball, OFF.ball.grabbableData);
             if (unityAlive(data)) {
                 const nameOffset = runtimeFieldOffset(data, "name");
@@ -2344,8 +2117,6 @@ Il2Cpp.perform(() => {
         autoAim.guidedKeys.add(key);
     }
 
-    // true once the ball is ours. Until then it keeps asking every AUTO_AIM_OWNERSHIP_RETRY_SECONDS
-    // (the shot's arc scores by itself meanwhile), so a slow server answer doesn't cancel the guidance.
     function ensureGuidedOwnership(guided, now) {
         try {
             if (G.ballOwnedLocally(guided.ball))
@@ -2362,8 +2133,6 @@ Il2Cpp.perform(() => {
         return false;
     }
 
-    // Swish shots: every AUTO_AIM_HOMING_INTERVAL, work out where the ball will cross the rim; if
-    // that's off by more than the tolerance, re-aim it at the rim center for the time that's left.
     function homeOnHoop(guided, position, velocity, now) {
         const plan = guided.plan;
         if (now < plan.nextHoming)
@@ -2390,14 +2159,12 @@ Il2Cpp.perform(() => {
         U.rbSetVelocity(guided.rigidbody, needed);
     }
 
-    // Bank shots: steers the ball back onto its planned arc when something knocked it off.
     function followPlannedArc(guided, position, velocity, now) {
         const plan = guided.plan;
         const elapsed = now - plan.launchedAt;
         if (elapsed < 0 || elapsed > plan.followUntil)
             return;
         const planned = ballisticState(plan.start, plan.velocity, plan.physics, elapsed);
-        // Same physics-step sag the launch aimed above.
         const offset = [0, 1, 2].map((axis) => planned.position[axis] + 0.5 * plan.physics.gravity[axis] * plan.physics.step * elapsed - position[axis]);
         const drift = Math.hypot(offset[0], offset[1], offset[2]);
         const speedError = Math.hypot(planned.velocity[0] - velocity[0], planned.velocity[1] - velocity[1], planned.velocity[2] - velocity[2]);
@@ -2416,8 +2183,6 @@ Il2Cpp.perform(() => {
         U.rbSetVelocity(guided.rigidbody, corrected);
     }
 
-    // Guidance keeps running for balls released with LT held, even after LT is let go. Balls
-    // fired from the ball stack are guided whether or not Auto Aim is on.
     function updateGuidedBalls(now, deltaTime) {
         if (autoAim.guided.length === 0)
             return;
@@ -2486,9 +2251,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Sends a ball on an arc into the hoop in the `facing` direction (the nearest one if `facing` is
-    // too short) and hands it to the in-flight guidance. A thrown ball passes its release velocity,
-    // which shapes the arc like a real shot.
     function launchAtHoop(ball, rigidbody, start, facing, now, { releaseVelocity = null, forced = false, hoop: chosen = null } = {}) {
         const angularVelocity = U.rbAngularVelocity(rigidbody);
         const best = chosen ?? findBestHoop(start, facing, now);
@@ -2510,8 +2272,6 @@ Il2Cpp.perform(() => {
         const physics = ballPhysics(rigidbody, ball);
         let flightTime = aimFlightTime(start, aimTarget);
         if (releaseVelocity && Math.hypot(hoop[0] - start[0], hoop[2] - start[2]) >= 1.6) {
-            // Flat release shoots flatter; jump shots keep the natural time but get flattened a
-            // little by release height so the arc never looks sky-high.
             const arcFactor = releaseVelocity[1] < 1.2 ? -0.15 : 0.0;
             const randomScale = 0.14 + Math.random() * 0.10;
             const heightFactor = clamp((start[1] - (hoop[1] - 0.8)) * randomScale, 0, 0.30);
@@ -2519,14 +2279,11 @@ Il2Cpp.perform(() => {
         }
         if (settings.autoAimMode === 0)
             flightTime = steepArcTime(start, aimTarget, physics.gravity, settings.shotArc);
-        // The physics step adds velocity before moving the ball, so over a flight it ends up
-        // ½·g·step·T below the exact arc; aim that much higher to land where the arc says.
         const stepTarget = [0, 1, 2].map((axis) => aimTarget[axis] - 0.5 * physics.gravity[axis] * physics.step * flightTime);
         const aimed = computeAimVelocity(start, stepTarget, flightTime, physics);
         let spin = angularVelocity;
         const horizontalSpeed = Math.hypot(aimed[0], aimed[2]);
         if (horizontalSpeed > 0.05) {
-            // Backspin perpendicular to the horizontal direction of travel.
             const spinSpeed = 4.5 + Math.random() * 2.0;
             spin = [-(aimed[2] / horizontalSpeed) * spinSpeed, angularVelocity[1] * 0.4, (aimed[0] / horizontalSpeed) * spinSpeed];
         }
@@ -2536,7 +2293,6 @@ Il2Cpp.perform(() => {
         }
         catch (_) { }
         G.ballSetVelocities(ball, aimed, spin);
-        // A bank shot is followed until just before the board, so the bounce stays natural.
         const plan = {
             start,
             velocity: aimed,
@@ -2613,7 +2369,6 @@ Il2Cpp.perform(() => {
             }
             return result;
         });
-        // A ball you grab leaves the orbit or stack on the spot instead of at the next ownership check.
         hookMethod(Game.NCGrabbable, "OnGrab", 1, null, (original) => function (grabber) {
             for (const formation of [orbit, ballStack]) {
                 const entry = formation.balls.get(keyOf(this));
@@ -2626,15 +2381,7 @@ Il2Cpp.perform(() => {
         });
     }
 
-    // ─────────────────────────────── Ball orbit & ball stack ───────────────────────────────
-
-    // Both pull every ball nobody is holding into a formation around you with rigidbody velocity, so
-    // Normcore keeps interpolating them for everyone. Ownership is checked a few times a second and
-    // asked for at most once a second per ball; only balls we own are moved (moving anyone else's
-    // just gets snapped back), and held, guided or freshly thrown balls are never touched.
     const orbit = { balls: new Map(), nextScan: 0 };
-    // Stack balls ignore each other's colliders (every ball that joined, in the stack or in flight),
-    // so they don't knock each other away from the hoop. Restored when the stack is let go.
     const ballStack = {
         balls: new Map(),
         nextScan: 0,
@@ -2676,7 +2423,6 @@ Il2Cpp.perform(() => {
         ballStack.colliders.clear();
     }
 
-    // Formation balls float without gravity while we move them; it comes back when they leave.
     function restoreGravity(entry) {
         if (!entry.gravityOff)
             return;
@@ -2707,8 +2453,6 @@ Il2Cpp.perform(() => {
     const releaseOrbitBalls = (stopMotion) => releaseFormation(orbit, stopMotion);
     const releaseBallStack = (stopMotion) => releaseFormation(ballStack, stopMotion);
 
-    // A held ball's ownership is locked by the game (preventOwnershipTakeover), so it joins once
-    // it's dropped.
     function formationEligible(ball, now) {
         if (autoAim.guidedKeys.has(ball.key))
             return false;
@@ -2741,7 +2485,6 @@ Il2Cpp.perform(() => {
                 continue;
             if (formation.onJoin)
                 formation.onJoin(ball.key, ball.pointer);
-            // Staggered, so a lobby full of balls doesn't send every ownership request in one frame.
             formation.balls.set(ball.key, {
                 ball: ball.pointer,
                 rigidbody: ball.rb,
@@ -2754,9 +2497,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // A dropped ball's view often stays with its last holder, and Normcore won't hand over the
-    // transform while the view belongs to someone else, so both are asked for (the game's own
-    // "if allowed" request, which only goes through when nobody holds the ball).
     function refreshFormationOwnership(key, entry, now) {
         entry.nextCheck = now + ORBIT_OWNERSHIP_CHECK_SECONDS;
         let held = true;
@@ -2787,8 +2527,6 @@ Il2Cpp.perform(() => {
         return true;
     }
 
-    // `place(index, count, now, center)` gives each ball its target and the velocity it drifts with.
-    // Only owned balls take a slot, so the rings never have gaps for balls still being claimed.
     function steerFormation(formation, now, center, place) {
         if (now >= formation.nextScan) {
             formation.nextScan = now + ORBIT_RESCAN_SECONDS;
@@ -2854,7 +2592,6 @@ Il2Cpp.perform(() => {
         };
     }
 
-    // Rings of up to BALL_STACK_PER_RING balls stacked above your head, turning slowly.
     function stackPlacement(index, count, now, center) {
         const ring = Math.floor(index / BALL_STACK_PER_RING);
         const slotInRing = index % BALL_STACK_PER_RING;
@@ -2877,7 +2614,6 @@ Il2Cpp.perform(() => {
             steerFormation(orbit, now, center, orbitPlacement);
     }
 
-    // Where you're looking, for picking the hoop to fire at.
     function headForward() {
         try {
             if (unityAlive(refs.camera))
@@ -2887,8 +2623,6 @@ Il2Cpp.perform(() => {
         return [0, 0, 0];
     }
 
-    // The hoop you're looking at: the one closest to your view direction, within
-    // BALL_STACK_AIM_CONE_DEGREES. Nothing in view means nothing fires.
     function hoopInView(from, facing, now) {
         const horizontal = Math.hypot(facing[0], facing[2]);
         if (horizontal < 0.2)
@@ -2917,7 +2651,6 @@ Il2Cpp.perform(() => {
         return best;
     }
 
-    // Fires the next owned ball in the stack at the hoop in front of you; false when nothing went.
     function fireStackBall(now) {
         const head = headPosition();
         const hoop = head ? hoopInView(head, headForward(), now) : null;
@@ -2943,7 +2676,6 @@ Il2Cpp.perform(() => {
         return false;
     }
 
-    // Balls fired into the hoop come back to the stack once they're done, so holding RT keeps going.
     function updateBallStack(now) {
         if (!toggles.ballStack)
             return;
@@ -2957,15 +2689,6 @@ Il2Cpp.perform(() => {
         fireStackBall(now);
     }
 
-    // ───────────────────────────────────── Steal ball ─────────────────────────────────────
-
-    // RT takes the ball your right hand's pointer is aimed at, at any distance. A ball someone is
-    // holding is knocked out of their hand through the game's own slap (its steal rules and cooldown
-    // apply, and it's what makes their game let go). Once nobody holds it, its ownership is asked for
-    // first: the game drops a held ball the moment it isn't ours (Grabber.CheckGrabRelease), so
-    // grabbing before that just drops and re-grabs it. Then the game's forced grab puts it in your
-    // hand, and it stays there while RT is held; letting go of RT hands it back to the grip, so
-    // without grip it's thrown like any ball.
     const stealBall = { triggerHeld: false, attempt: null, keep: null };
 
     const handHolding = (grabber) => OFF.grabber.held >= 0 && unityAlive(readPointerAt(grabber, OFF.grabber.held));
@@ -2985,8 +2708,6 @@ Il2Cpp.perform(() => {
         return NULL;
     }
 
-    // The game's own pointer on the right hand shows where it aims; the hand transform is the
-    // fallback.
     function stealRay() {
         let source = NULL;
         try {
@@ -3030,7 +2751,6 @@ Il2Cpp.perform(() => {
                     continue;
                 const miss = Math.sqrt(Math.max(0, distance * distance - along * along));
                 const hit = miss <= STEAL_BALL_RAY_RADIUS + distance * STEAL_BALL_RAY_RADIUS_PER_METER;
-                // Hits rank by distance along the ray, ahead of every near-miss (ranked by angle).
                 const score = hit ? along : 1000 + angle;
                 if (!best || score < best.score)
                     best = { ball, position, score };
@@ -3069,7 +2789,6 @@ Il2Cpp.perform(() => {
     function installStealBallHook() {
         if (!Game.Grabber)
             return;
-        // Called every frame for a hand that's holding something; RT keeps a stolen ball in hand.
         hookMethod(Game.Grabber, "playerDidActivateRelease", 1, null, (original) => function (held) {
             const kept = stealBall.keep;
             if (kept && sameObject(this, kept.grabber)) {
@@ -3096,7 +2815,6 @@ Il2Cpp.perform(() => {
                 stealBall.attempt = null;
                 return;
             }
-            // The grab already happened: done once the hand really has it.
             if (!attempt.grabber.isNull()) {
                 if (handHoldsBall(attempt.grabber, attempt.ball)) {
                     stealBall.keep = { grabber: attempt.grabber, ball: attempt.ball };
@@ -3135,11 +2853,20 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ──────────────────────────────────── Grip spawn ────────────────────────────────────
+    function updateOwnershipSpam() {
+        if (!toggles.ownershipSpam)
+            return;
+        for (const ball of trackedBalls(clock())) {
+            try {
+                if (G.ballHeldBySomeone(ball.pointer) || G.ballOwnedLocally(ball.pointer))
+                    continue;
+                for (let repeat = 0; repeat < OWNERSHIP_SPAM_REPEATS; repeat++)
+                    G.ballRequestTransformOwnership(ball.pointer);
+            }
+            catch (_) { }
+        }
+    }
 
-    // Gripping with an empty hand spawns a ball into it: the same ball the game hands you on B, with
-    // the same spawn cooldown. A grip that picks something up by itself first is left alone, so
-    // grabbing real balls still works.
     const gripSpawn = {
         hands: [
             { side: 0, grip: () => input.leftGrip, grabber: () => refs.grabberLeft, down: false, checkAt: 0 },
@@ -3154,7 +2881,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // The grabber's own grip threshold, so a "grip" here is exactly what the game treats as one.
     function gripThreshold(grabber) {
         if (OFF.grabber.gripAmount >= 0) {
             const amount = readFloatAt(grabber, OFF.grabber.gripAmount);
@@ -3173,7 +2899,6 @@ Il2Cpp.perform(() => {
             return;
         const grabbable = readPointerAt(ball, OFF.ball.grabbable);
         const ballAt = ballPosition(ball);
-        // Only grab it when it really is the ball that just appeared at this hand.
         if (!unityAlive(grabbable) || !ballAt ||
             distanceSquared(ballAt, U.position(U.componentTransform(grabber))) > GRIP_SPAWN_GRAB_DISTANCE * GRIP_SPAWN_GRAB_DISTANCE)
             return;
@@ -3202,8 +2927,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Visuals ───────────────────────────────────────
-
     const visuals = {
         players: new Map(),
         ballLines: new Map(),
@@ -3218,8 +2941,6 @@ Il2Cpp.perform(() => {
 
     const anyVisualEnabled = () => toggles.ballEsp || toggles.playerTracers || toggles.ballTracers;
 
-    // Proxy materials with ZTest Always, so tracers and markers render through walls without
-    // touching the targets' own materials.
     function throughWallMaterial(color) {
         let material = NULL;
         let handle = null;
@@ -3545,8 +3266,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ───────────────────────────────────── Hoop hitbox ─────────────────────────────────────
-
     const hoopHitbox = { colliders: new Map(), nextRescan: 0, scope: [] };
 
     const hoopHitboxChoice = () => HOOP_HITBOX_CHOICES.find((choice) => choice.width === settings.hoopHitbox) ?? HOOP_HITBOX_CHOICES[1];
@@ -3595,8 +3314,6 @@ Il2Cpp.perform(() => {
                     changed = expandHoopCollider(readPointerAt(zone, OFF.scoreZone.box)) || changed;
             }
         }
-        // Some maps route the same ScoreZone through a small forwarding trigger. Only that trigger's
-        // BoxCollider is widened; rim, backboard, net and shield colliders stay untouched.
         if (OFF.scoreZoneTrigger.zone >= 0) {
             for (const trigger of objectsOfType(Game.ScoreZoneTrigger)) {
                 try {
@@ -3647,12 +3364,8 @@ Il2Cpp.perform(() => {
             restoreHoopHitboxes();
     }
 
-    // ─────────────────────────────────── Points per shot ───────────────────────────────────
-
     const scoreAward = { hooksReady: false, depth: 0, consumed: false };
 
-    // Scoped to a real score event from a ball the local player shot: the game's own reliable
-    // IncrementScore write is changed once, and no extra score event or network call is sent.
     function installScoreAwardHooks() {
         if (!Game.GameEventService || !Game.CompetitiveGameSync) {
             log("points-per-shot hooks unavailable: score classes missing");
@@ -3698,8 +3411,6 @@ Il2Cpp.perform(() => {
         log(scoreAward.hooksReady ? "points-per-shot hooks installed" : "points-per-shot hooks unavailable");
     }
 
-    // ──────────────────────────────── Gold score explosion ────────────────────────────────
-
     const goldExplosion = { model: NULL, originalSku: null, nextRefresh: 0 };
 
     function restoreGoldExplosion() {
@@ -3744,8 +3455,6 @@ Il2Cpp.perform(() => {
         goldExplosion.nextRefresh = now + GOLD_EXPLOSION_REFRESH_SECONDS;
         applyGoldExplosion();
     }
-
-    // ───────────────────────────── Rainbow & all score effects ─────────────────────────────
 
     const scoreEffects = {
         hooksReady: false,
@@ -3921,8 +3630,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Caps a synthetic score effect's particle budget. Small systems are allocated first so unused
-    // capacity is redistributed; every system keeps Unity's minimum of one particle.
     function forgetScoreEffect(key) {
         const entry = scoreEffects.active.get(key);
         if (!entry)
@@ -3979,8 +3686,6 @@ Il2Cpp.perform(() => {
             return;
         entry.stopRequestedAt = now;
         removeRainbowVfx(entry.root);
-        // StopEmittingAndClear = 0. The game's coroutine stays responsible for the single
-        // ReturnToPool call.
         if (unityAlive(entry.root)) {
             try {
                 U.particleStop(entry.root, 1, 0);
@@ -4013,7 +3718,6 @@ Il2Cpp.perform(() => {
                     forgetScoreEffect(key);
                 }
                 else if (now - entry.stopRequestedAt >= ALL_SCORE_EFFECTS_STOP_GRACE_SECONDS) {
-                    // Stay capped and retry instead of restoring a live effect to its huge limit.
                     stopScoreEffect(entry, now, true);
                 }
                 continue;
@@ -4055,8 +3759,6 @@ Il2Cpp.perform(() => {
         scoreEffects.nextCleanupTime = 0;
     }
 
-    // Already-sent room events cannot be recalled, so echo tokens and live roots stay protected
-    // until they expire or return to the pool.
     function cancelUnsentScoreEffects() {
         scoreEffects.pending.length = 0;
         scoreEffects.burst = null;
@@ -4094,8 +3796,6 @@ Il2Cpp.perform(() => {
         const now = clock();
         if (scoreEffects.pending.length > 0 || now < scoreEffects.nextSequenceTime)
             return;
-        // A new basket replaces lingering visuals from the previous one; stopped roots stay capped
-        // and tracked until the pool takes them back.
         for (const entry of scoreEffects.active.values())
             stopScoreEffect(entry, now);
         scoreEffects.nextCleanupTime = 0;
@@ -4153,8 +3853,6 @@ Il2Cpp.perform(() => {
             return;
         }
         scoreEffects.unavailableSince = 0;
-        // Network sends are at-most-once: PlayVFXSynced can commit a reliable model update before
-        // throwing, so retrying could duplicate it.
         const pending = scoreEffects.pending.shift();
         const echo = { sku: pending.sku, position: pending.position, expiresAt: now + ALL_SCORE_EFFECTS_SYNC_ECHO_WINDOW_SECONDS };
         while (scoreEffects.echoes.length >= ALL_SCORE_EFFECTS_MAX_ECHO_TOKENS)
@@ -4212,8 +3910,6 @@ Il2Cpp.perform(() => {
             return OFF.item.sku >= 0 ? readIntAt(item, OFF.item.sku) : 0;
         };
         const installed = [
-            // The game's own score send confirms the basket and tells us which effect is equipped,
-            // so that one is left out of the sequence.
             hookMethod(Game.VFXSync, "PlayVFXSynced", 2, null, (original) => function (vfxSku, position) {
                 const sku = Number(vfxSku);
                 if (scoreEffects.localCandidateDepth > 0 && scoreEffects.syncedDispatchDepth === 0 && Number.isFinite(sku) && sku > 0) {
@@ -4222,8 +3918,6 @@ Il2Cpp.perform(() => {
                 }
                 return original(this, vfxSku, position);
             }),
-            // PlayVFXSynced echoes back through PlayVFXLocally on the sender. Only effects from the
-            // sequence (ours or another modded player's) get the short lifetime and particle cap.
             hookMethod(Game.VFXSync, "PlayVFXLocally", 2, null, (original) => function (vfxSku, position) {
                 const now = clock();
                 const sku = Number(vfxSku);
@@ -4317,10 +4011,6 @@ Il2Cpp.perform(() => {
         log(scoreEffects.hooksReady ? "rainbow and synchronized score-effect hooks installed" : "some score-effect hooks are unavailable");
     }
 
-    // ───────────────────────────── PlayerPrefs (migration only) ─────────────────────────────
-
-    // Earlier versions kept the outfit and aim settings in PlayerPrefs. They're read once to seed the
-    // config file and never written again.
     function prefsGetInt(key, fallback) {
         try {
             return Number(U.prefsGetInt(managed(key), Math.trunc(fallback)));
@@ -4360,9 +4050,6 @@ Il2Cpp.perform(() => {
             settings.autoAimLegit = aimGuide;
     }
 
-    // ─────────────────────────────────── Locker items ───────────────────────────────────
-
-    // Called thousands of times while the locker rebuilds, so it reads fields straight from memory.
     function inspectLockerItem(item) {
         const pointer = toPointer(item);
         if (pointer.isNull() || OFF.item.sku < 0 || OFF.item.type < 0)
@@ -4373,7 +4060,6 @@ Il2Cpp.perform(() => {
                 return null;
             const usageType = OFF.item.usage >= 0 ? pointer.add(OFF.item.usage).readS32() : 0;
             const itemType = pointer.add(OFF.item.type).readS32();
-            // Only equippable locker content; currency, boosts and consumables stay untouched.
             const equippable = (itemType >= 1 && itemType <= 14) ||
                 itemType === 16 ||
                 itemType === 17 ||
@@ -4385,7 +4071,6 @@ Il2Cpp.perform(() => {
             if (usageType === 2 || !equippable)
                 return null;
             const milestone = OFF.item.milestone >= 0 ? pointer.add(OFF.item.milestone).readS32() : 0;
-            // Dev items: the milestone-tagged mod avatar and the Developer title (no milestone marker).
             return { sku, itemType, dev: milestone >= 100 || sku === DEVELOPER_TITLE_SKU };
         }
         catch (_) {
@@ -4394,14 +4079,9 @@ Il2Cpp.perform(() => {
     }
 
     const locker = {
-        // The outfit Unlock All keeps on you: item type -> { itemType, sku }. Stored in the config file.
         saved: new Map(),
-        // SKUs that count as owned for the rest of the session: items put on while Unlock All was on,
-        // titles from the menu, and the saved outfit once Unlock All is on.
         unlockedSkus: new Set(),
-        // SKUs shown as owned in the current locker view.
         exposedSkus: new Set(),
-        // Per-thread depth counters for the game calls being hooked.
         automaticDepthByThread: new Map(),
         outfitDepthByThread: new Map(),
         strictDepthByThread: new Map(),
@@ -4463,8 +4143,6 @@ Il2Cpp.perform(() => {
     function allowsLockerOwnership(info, threadId) {
         if (!info)
             return false;
-        // What you're wearing stays owned, so the game's ownership checks after an equip or a
-        // lobby change don't strip it again.
         if (locker.unlockedSkus.has(info.sku))
             return true;
         if (!toggles.unlockAll || threadId === null)
@@ -4475,11 +4153,8 @@ Il2Cpp.perform(() => {
             return true;
         const filterType = topOfStack(locker.filterTypeStackByThread, threadId);
         if (filterType !== null) {
-            // Owned (15) stays bounded to items the user actually picked (checked above): treating
-            // the whole 859-item catalog as owned pushed the Quest past 4.4 GB and hung the locker.
             if (filterType === 15)
                 return false;
-            // Only the item FilterItem is currently evaluating is admitted.
             const filterSku = topOfStack(locker.filterSkuStackByThread, threadId);
             if (filterSku !== null && filterSku >= 0 && filterSku === info.sku) {
                 locker.exposedSkus.add(info.sku);
@@ -4487,7 +4162,6 @@ Il2Cpp.perform(() => {
             }
             return false;
         }
-        // Loading one of the game's saved outfits equips each of its items.
         if ((locker.outfitDepthByThread.get(threadId) ?? 0) > 0) {
             markLockerItem(info);
             return true;
@@ -4497,7 +4171,6 @@ Il2Cpp.perform(() => {
         return locker.exposedSkus.has(info.sku);
     }
 
-    // Ownership predicates run in bursts while cards rebuild; one UI probe covers each burst.
     const lockerUiProbeState = { value: false, at: 0 };
     function lockerUiProbe() {
         const now = clock();
@@ -4522,16 +4195,12 @@ Il2Cpp.perform(() => {
     }
 
     function refreshLockerItems() {
-        // Consume the request before entering native UI code: a failing FilterItems must not
-        // retry every frame and cause an allocation/rebuild storm.
         locker.refreshPending = false;
         try {
             const manager = statics.iapManager();
             if (!unityAlive(manager))
                 return;
             const managerObject = new Il2Cpp.Object(manager);
-            // Refresh only repaints existing cards; re-applying the active filter rebuilds the
-            // Owned list so newly exposed items show up immediately.
             const filter = readPointerAt(manager, OFF.iapManager.filter);
             if (unityAlive(filter))
                 managerObject.method("FilterItems", 1).overload("VRItemFilter").invoke(new Il2Cpp.Object(filter));
@@ -4561,8 +4230,6 @@ Il2Cpp.perform(() => {
         catch (_) { }
     }
 
-    // GetItemBySKU hands back a brand-new blank item for a SKU the game doesn't have, so the SKU is
-    // checked against the catalog first.
     function catalogHas(manager, sku) {
         return !!G.itemExists(manager, managed(String(Math.trunc(sku))));
     }
@@ -4579,8 +4246,6 @@ Il2Cpp.perform(() => {
             return NULL;
         }
     }
-
-    // ────────────────────────────────── Saved outfit ──────────────────────────────────
 
     function persistLockerItem(info, reason) {
         const itemType = Math.trunc(info.itemType);
@@ -4616,20 +4281,16 @@ Il2Cpp.perform(() => {
         if (enabled) {
             for (const entry of locker.saved.values())
                 locker.unlockedSkus.add(entry.sku);
-            // Switching it on puts the saved outfit back on right away; only a new lobby waits.
             locker.modelKey = keyOf(refs.localModel);
             locker.settleUntil = 0;
             locker.nextReapply = 0;
             locker.attempts.clear();
             locker.gaveUp.clear();
         }
-        // The native list rebuild runs on the next tick, outside this button press.
         locker.refreshPending = true;
         locker.nextUiCheck = 0;
     }
 
-    // PlayerSync.Equip is the public, replicated path; the item's own virtual Equip handles the
-    // few items whose requirements make the wrapper refuse them.
     function equipCatalogItem(playerSync, item) {
         let equipped = false;
         try {
@@ -4656,8 +4317,6 @@ Il2Cpp.perform(() => {
             markLockerItem(info);
             if (!equipCatalogItem(playerSync, item))
                 return false;
-            // Also store it as the game's own saved customization, so the game's spawn loader puts
-            // it back on you in the next lobby before this script has to.
             try {
                 if (Number(G.getLocalCustomization(info.itemType)) !== info.sku)
                     G.saveLocalCustomization(info.itemType, info.sku);
@@ -4670,9 +4329,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Keeps the saved outfit on you. After a spawn (new lobby or map) it waits for the game's own
-    // loader, then re-equips only the slots that don't match. Each slot gets OUTFIT_MAX_ATTEMPTS
-    // tries per lobby, so an item the game keeps refusing can't cause an equip loop.
     function updateOutfit(now) {
         if (!toggles.unlockAll || locker.saved.size === 0 || now < locker.nextReapply)
             return;
@@ -4694,7 +4350,6 @@ Il2Cpp.perform(() => {
         for (const entry of locker.saved.values()) {
             if (equipped >= OUTFIT_REAPPLY_BURST)
                 break;
-            // Titles have their own keeper.
             if (locker.gaveUp.has(entry.itemType) || entry.itemType === TITLE_ITEM_TYPE)
                 continue;
             let current = Number.NaN;
@@ -4718,7 +4373,6 @@ Il2Cpp.perform(() => {
             log(`re-equipped ${equipped} saved outfit item(s)`);
     }
 
-    // A map change keeps Unlock All on and the outfit owned; only per-lobby bookkeeping resets.
     function onLockerSceneChange() {
         for (const collection of [locker.exposedSkus, locker.automaticDepthByThread, locker.outfitDepthByThread,
             locker.strictDepthByThread, locker.equipDepthByThread, locker.equipSkuByThread, locker.cardDepthByThread,
@@ -4764,7 +4418,6 @@ Il2Cpp.perform(() => {
             if ((locker.equipDepthByThread.get(threadId) ?? 0) > 0 && locker.equipSkuByThread.get(threadId) === info.sku)
                 markLockerItem(info);
         };
-        // Counts a game call as in progress on its thread for as long as it runs.
         const depthScope = (map) => ({
             onEnter() {
                 this.lockerThread = this.threadId;
@@ -4775,10 +4428,6 @@ Il2Cpp.perform(() => {
                     decrementDepth(map, this.lockerThread);
             },
         });
-        // The game saves your outfit slots on its own in two places: its spawn loader re-saves each
-        // slot it loads, and its ownership check clears slots holding items you don't own. Neither is
-        // you changing your outfit. If these can't be hooked, those saves would count as yours, so
-        // that's logged; everything else still installs.
         try {
             attach(Game.NCNetworkPlayerDataController, "LoadSavedCustomization", 0, null, depthScope(locker.automaticDepthByThread));
             attach(Game.NCNetworkPlayerData, "UpdateAvatarCustomizations", 1, null, depthScope(locker.automaticDepthByThread));
@@ -4815,8 +4464,6 @@ Il2Cpp.perform(() => {
                         popStack(locker.filterSkuStackByThread, this.lockerThread);
                 },
             });
-            // With Unlock All on, the locker item being pressed is admitted as owned so its equip
-            // goes through.
             const equipScope = (klass, name, argc, itemOf) => attach(klass, name, argc, null, {
                 onEnter(args) {
                     const threadId = this.threadId;
@@ -4837,9 +4484,6 @@ Il2Cpp.perform(() => {
                 },
             });
             const buttonItem = (args) => OFF.iapButton.item >= 0 ? readPointerAt(args[0], OFF.iapButton.item) : NULL;
-            // UpdateDisplay runs its ownership checks after FilterItem returns, and again whenever the
-            // recycling scroll list refills a card (ConfigureCell); scope them to the one card being
-            // drawn so it shows Equip/Owned without exposing unrelated catalog entries.
             attach(Game.DLIAPButton, "UpdateDisplay", 0, null, {
                 onEnter(args) {
                     const info = inspectLockerItem(buttonItem(args));
@@ -4862,9 +4506,6 @@ Il2Cpp.perform(() => {
             equipScope(Game.DLIAPManager, "ItemButtonPressed", 1, (args) => args[1]);
             if (Game.UIManager)
                 attach(Game.UIManager, "MenuOutfitLoad", 1, null, depthScope(locker.outfitDepthByThread));
-            // Apart from the game's automatic saves (hooked above) and this script's re-apply, a slot
-            // save is you changing your outfit: locker items and collections, Unequip All, Random
-            // Outfit, loading an outfit slot, or a purchase the game puts straight on.
             attach(Game.IAPItemSO, "SaveLocalCustomization", 2, null, {
                 onEnter(args) {
                     if (locker.applyDepth > 0 || (locker.automaticDepthByThread.get(this.threadId) ?? 0) > 0)
@@ -4872,7 +4513,6 @@ Il2Cpp.perform(() => {
                     const itemType = args[0].toInt32();
                     const sku = args[1].toInt32();
                     lockerLog(`you saved slot ${itemType} -> ${sku}`);
-                    // Your title is kept by the title keeper (and saved) whether or not Unlock All is on.
                     if (itemType === TITLE_ITEM_TYPE) {
                         if (sku > 0)
                             setDesiredTitle(sku, titleLabel(sku));
@@ -4931,8 +4571,6 @@ Il2Cpp.perform(() => {
                 onLeave(returnValue) {
                     if (nativeTrue(returnValue))
                         return;
-                    // IsOwnedOrAchieved calls this for staff/mod items; the strict outer probe sees the
-                    // real result so it can mark the SKU before replacing the final answer.
                     if ((locker.strictDepthByThread.get(this.threadId) ?? 0) > 0)
                         return;
                     const info = inspectLockerItem(this.lockerItem);
@@ -4949,10 +4587,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Titles ───────────────────────────────────────
-
-    // The title you pick here or in the game's locker is kept on you and saved in the config, so it
-    // comes back after respawns, lobby changes and restarts.
     const titles = {
         catalog: [],
         desiredSku: null,
@@ -5002,8 +4636,6 @@ Il2Cpp.perform(() => {
         markConfigDirty();
     }
 
-    // Every title in the game's own item catalog: exactly the titles that can be equipped and that
-    // other players' games can show.
     function refreshTitleCatalog() {
         const bySku = new Map();
         try {
@@ -5032,8 +4664,6 @@ Il2Cpp.perform(() => {
         return titles.catalog.length;
     }
 
-    // Takes your current title off, puts the chosen one on and remembers it. Returns "ok",
-    // "failed", or "missing" when the game no longer has that title.
     function equipTitle(sku, label) {
         try {
             const manager = statics.iapManager();
@@ -5060,13 +4690,10 @@ Il2Cpp.perform(() => {
                     const previous = current > 0 ? catalogItem(current) : NULL;
                     if (!previous.isNull())
                         G.playerSyncUnequip(playerSync, previous);
-                    // A few catalog titles carry an item requirement that makes the public PlayerSync
-                    // wrapper reject them; the item's own Equip performs the same replicated update.
                     equipCatalogItem(playerSync, item);
                     const actual = Number(G.modelTitle(model));
                     if (actual !== sku)
                         throw new Error(`title equip did not stick; current SKU is ${actual}`);
-                    // Also the game's own saved title, so its spawn loader puts it back on.
                     G.saveLocalCustomization(TITLE_ITEM_TYPE, sku);
                 }
                 finally {
@@ -5089,8 +4716,6 @@ Il2Cpp.perform(() => {
             log(`title ${label} (${sku}) isn't in the game anymore`);
     }
 
-    // Puts the saved title back on after respawns and lobby changes. A few tries per lobby, so a
-    // title the game won't take can't cause an equip loop.
     function updateTitleKeeper(now) {
         if (titles.desiredSku === null || now < titles.nextRefresh)
             return;
@@ -5122,9 +4747,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Levels ───────────────────────────────────────
-
-    // The level you set is saved in the config and re-applied every session.
     const levels = { desiredXp: null, desiredLevel: null, nextRefresh: 0, nextAction: 0 };
 
     function roomSessionModel() {
@@ -5192,7 +4814,6 @@ Il2Cpp.perform(() => {
             const progression = progressionManager();
             if (progression) {
                 const current = Number(progression.method("GetXP", 0).invoke());
-                // Never erase XP legitimately earned after the button was used.
                 if (Number.isFinite(current) && Math.trunc(current) > desired)
                     levels.desiredXp = Math.trunc(current);
                 else if (!Number.isFinite(current) || Math.trunc(current) < desired)
@@ -5302,7 +4923,6 @@ Il2Cpp.perform(() => {
             let roomUpdated = false;
             if (room) {
                 try {
-                    // The generated setter dirties the model's ReliableProperty directly.
                     room.method("set_reputation", 1).invoke(Math.trunc(targetXp));
                     roomUpdated = Number(room.method("get_reputation", 0).invoke()) === Math.trunc(targetXp);
                 }
@@ -5315,10 +4935,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // ─────────────────────────────────────── Config file ───────────────────────────────────────
-
-    // Every toggle, setting and the saved outfit live in a JSON file in the game's own storage. It's
-    // read at boot, before any hook can fire, and rewritten shortly after anything changes.
     const configFile = {
         directories: [],
         path: "",
@@ -5376,8 +4992,6 @@ Il2Cpp.perform(() => {
 
     function gamePackageName() {
         try {
-            // The process name, up to the NUL (or a ":service" suffix). Read as bytes: the text
-            // reader rejects the NULs in cmdline.
             let name = "";
             for (const byte of new Uint8Array(File.readAllBytes("/proc/self/cmdline"))) {
                 if (byte === 0 || byte === 0x3a)
@@ -5389,7 +5003,6 @@ Il2Cpp.perform(() => {
         }
         catch (_) { }
         try {
-            // /data/app/~~<hash>/<package>-<hash>/lib/arm64/libil2cpp.so
             const match = /\/([A-Za-z]\w*(?:\.\w+)+)-[^/]+\//.exec(Process.getModuleByName("libil2cpp.so").path);
             if (match)
                 return match[1];
@@ -5420,7 +5033,6 @@ Il2Cpp.perform(() => {
         }
     }
 
-    // Written next to the target and renamed over it, so quitting mid-save can't leave half a file.
     function writeTextFile(path, text) {
         const temporary = `${path}.tmp`;
         File.writeAllText(temporary, text);
@@ -5429,8 +5041,6 @@ Il2Cpp.perform(() => {
         File.writeAllText(path, text);
     }
 
-    // This session's log goes to log.txt next to the config; the previous session's is kept as
-    // log.prev.txt, so what happened before a crash survives the restart.
     function openLogFile(directory) {
         try {
             makeDirectories(directory);
@@ -5453,7 +5063,6 @@ Il2Cpp.perform(() => {
     function serializeConfig() {
         return JSON.stringify({
             version: CONFIG_VERSION,
-            username: customName.desired,
             toggles: Object.fromEntries(savedToggleKeys().map((key) => [key, toggles[key]])),
             settings: {
                 shootBoostPercent: settings.shootBoostPercent,
@@ -5474,7 +5083,6 @@ Il2Cpp.perform(() => {
         }, null, 2);
     }
 
-    // Anything missing or out of range keeps its default, so a hand-edited file can't break the menu.
     function applyConfig(data) {
         if (!data || typeof data !== "object")
             throw new Error("not a JSON object");
@@ -5485,12 +5093,6 @@ Il2Cpp.perform(() => {
                 toggles[key] = savedToggles[key];
         }
         const saved = section("settings");
-        if (typeof data.username === "string" && data.username.trim().length > 0)
-            customName.desired = data.username.trim();
-        else if (typeof saved.username === "string" && saved.username.trim().length > 0)
-            customName.desired = saved.username.trim();
-        else
-            customName.desired = "";
         if (Number.isFinite(saved.shootBoostPercent))
             settings.shootBoostPercent = clamp(Math.round(saved.shootBoostPercent / SHOOT_BOOST_STEP) * SHOOT_BOOST_STEP, SHOOT_BOOST_MIN, SHOOT_BOOST_MAX);
         if (POINTS_PER_SHOT_CHOICES.includes(saved.pointsPerShot))
@@ -5521,7 +5123,6 @@ Il2Cpp.perform(() => {
             titles.desiredSku = title.sku;
             titles.desiredLabel = typeof title.label === "string" && title.label ? title.label : titleLabel(title.sku);
         }
-        // Earlier builds kept the title in the outfit list.
         const outfitTitle = locker.saved.get(TITLE_ITEM_TYPE);
         if (outfitTitle) {
             locker.saved.delete(TITLE_ITEM_TYPE);
@@ -5549,7 +5150,6 @@ Il2Cpp.perform(() => {
             `/data/data/${packageName}/files/${CONFIG_DIRECTORY}`,
         ];
 
-        // Ensure all required menu directories exist immediately at boot to prevent access violations
         for (const dir of configFile.directories) {
             try {
                 makeDirectories(dir);
@@ -5573,8 +5173,6 @@ Il2Cpp.perform(() => {
             try {
                 applyConfig(JSON.parse(text));
                 configFile.loaded = true;
-                // Admitted before the hooks go in, so the game's first ownership checks keep the outfit
-                // and the title.
                 if (toggles.unlockAll) {
                     for (const entry of locker.saved.values())
                         locker.unlockedSkus.add(entry.sku);
@@ -5593,7 +5191,6 @@ Il2Cpp.perform(() => {
             return;
         }
 
-        // If no config file was present, set default path and save current defaults immediately
         if (!configFile.path && configFile.directories.length > 0) {
             configFile.path = `${configFile.directories[0]}/${CONFIG_FILE}`;
             try {
@@ -5639,8 +5236,6 @@ Il2Cpp.perform(() => {
             saveConfig();
     }
 
-    // First tick, on the main thread: settings from older PlayerPrefs-based versions are carried
-    // over once, then whatever the config left on is switched on.
     function restoreConfig() {
         if (!configFile.loaded) {
             migrateLegacyPrefs();
@@ -5671,18 +5266,9 @@ Il2Cpp.perform(() => {
             log(`saved outfit: ${locker.saved.size} item(s)${toggles.unlockAll ? "" : " (applies when Unlock All is on)"}`);
     }
 
-    // ────────────────────────────────────── Soundboard ──────────────────────────────────────
-
-    // Plays .wav files from Overdose/Sounds into voice chat, like the Overdose GTag soundboard.
-    // Big Ballers talks over Vivox, whose native SDK can "inject" a WAV file into your voice session
-    // as if it came from the mic; the Unity-side call for it is stripped, so the request is built
-    // with the SDK wrapper's own exports. Vivox takes mono 16-bit WAVs, so every sound is converted
-    // once to 48 kHz mono, and the same audio plays locally so you hear it too.
     const VOICE_SAMPLE_RATE = 48000;
     const SOUND_MAX_SECONDS = 30;
     const SOUND_LABEL_LENGTH = 28;
-    // Vivox audio-injection controls. Restart stops whatever is playing and starts the new file;
-    // it works when nothing is playing, and stop is harmless when idle.
     const INJECTION_STOP = 0;
     const INJECTION_RESTART = 2;
 
@@ -5735,7 +5321,6 @@ Il2Cpp.perform(() => {
     const overdoseDirectory = () => configFile.path ? configFile.path.slice(0, configFile.path.lastIndexOf("/")) : (configFile.directories[0] ?? "");
     const soundsDirectory = () => `${overdoseDirectory()}/${SOUNDS_DIRECTORY}`;
 
-    // Directory listing with managed fallback to prevent access violations
     function listDirectory(path) {
         const names = [];
         try {
@@ -5794,7 +5379,6 @@ Il2Cpp.perform(() => {
         return soundboard.sounds.length;
     }
 
-    // Converted sounds are made again on their next press (after a reload or a volume change).
     function forgetPreparedSounds() {
         cancelSoundJobs();
         for (const prepared of soundboard.prepared.values())
@@ -5811,8 +5395,6 @@ Il2Cpp.perform(() => {
         log(count > 0 ? `loaded ${count} sound(s)` : `no sounds found; put audio files (.wav, .mp3, .ogg, .m4a...) in ${soundsDirectory()}`);
     }
 
-    // ─── WAV decoding ───
-
     function* decodeWavSteps(buffer) {
         const view = new DataView(buffer);
         const tag = (offset) => String.fromCharCode(...new Uint8Array(buffer, offset, 4));
@@ -5827,7 +5409,6 @@ Il2Cpp.perform(() => {
             const body = offset + 8;
             if (id === "fmt ") {
                 let encoding = view.getUint16(body, true);
-                // WAVE_FORMAT_EXTENSIBLE keeps the real encoding at the start of its sub-format GUID.
                 if (encoding === 0xfffe && size >= 26)
                     encoding = view.getUint16(body + 24, true);
                 format = { encoding, channels: view.getUint16(body + 2, true), rate: view.getUint32(body + 4, true), bits: view.getUint16(body + 14, true) };
@@ -5877,11 +5458,6 @@ Il2Cpp.perform(() => {
         return { samples: mono, rate: format.rate, truncated };
     }
 
-    // ─── Native sample kernels ───
-
-    // The per-sample loops (mixing to mono, resampling, the loudness curve) are thousands of times
-    // faster compiled than in the script engine. Built once with Frida's CModule; if that isn't
-    // available, the sliced JS loops do the same work.
     const SOUND_KERNELS_SOURCE = `
 extern float tanhf (float);
 
@@ -5988,8 +5564,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return pointer;
     }
 
-    // ─── Other formats: Android's decoder ───
-
     const toNumber = (value) => typeof value === "number" ? value : value.toNumber();
 
     function mediaNatives() {
@@ -6051,7 +5625,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
     const MEDIA_FORMAT_CHANGED = -2;
     const MEDIA_PCM_FLOAT = 4;
 
-    // Decodes the first audio track to mono samples, like decodeWav.
     function* decodeWithMediaCodecSteps(filePath) {
         const media = mediaNatives();
         if (!media)
@@ -6134,7 +5707,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
                     continue;
                 }
                 if (output < 0) {
-                    // The decoder works on its own threads; check back next slice.
                     yield;
                     continue;
                 }
@@ -6199,8 +5771,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         }
     }
 
-    // WAV is read directly; other formats, and WAVs in encodings decodeWav doesn't handle, go through
-    // Android's decoder.
     function* decodeSoundSteps(sound) {
         if (/\.wav$/i.test(sound.name)) {
             try {
@@ -6214,7 +5784,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return yield* decodeWithMediaCodecSteps(sound.path);
     }
 
-    // Linear interpolation to the voice rate.
     function* resampleSteps(samples, fromRate, toRate) {
         if (fromRate === toRate)
             return samples;
@@ -6262,7 +5831,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return buffer;
     }
 
-    // The boosted 16-bit voice WAV (see makeLoudSteps), made in one native pass when it can be.
     function* voiceWavSteps(samples, boost) {
         const kernels = soundKernels();
         if (kernels && samples.length > 0) {
@@ -6305,8 +5873,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return buffer;
     }
 
-    // Brings the loudest point to full scale, then pushes quieter parts up by `boost` through a
-    // tanh soft limiter: louder without hard clipping. At 1x it's just normalized.
     function* makeLoudSteps(samples, boost) {
         let peak = 0;
         for (let index = 0; index < samples.length; index++) {
@@ -6327,14 +5893,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return output;
     }
 
-    // ─── Playback ───
-
-    // Converted once per session: a boosted 48 kHz mono WAV for Vivox, and an AudioClip at the
-    // file's own level for playing it on your headset (the Sound Volume boost is only for others).
-    // Converted sounds stay in .soundcache between sessions: the 48 kHz mono samples (.f32, for your
-    // headset and for re-boosting) and the boosted voice WAV. index.json remembers which source file
-    // (by size) and which Sound Volume each was made from, so a changed file is converted again and
-    // a volume change only redoes the quick boost step.
     const SOUND_CACHE_INDEX = "index.json";
 
     function readSoundCacheIndex(cacheDirectory) {
@@ -6366,7 +5924,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
     function* prepareSoundSteps(sound) {
         const cacheDirectory = `${overdoseDirectory()}/${SOUND_CACHE_DIRECTORY}`;
         makeDirectories(cacheDirectory);
-        // horn.wav -> horn.wav, horn.mp3 -> horn.mp3.wav, so two formats of one name don't collide.
         const voicePath = `${cacheDirectory}/${sound.name.replace(/\.wav$/i, "")}.wav`;
         const samplesPath = `${cacheDirectory}/${sound.name}.f32`;
         const index = readSoundCacheIndex(cacheDirectory);
@@ -6449,7 +6006,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return soundboard.vivox;
     }
 
-    // Your Vivox session group: the voice session every lobby channel you're in belongs to.
     function voiceGroupHandle() {
         const service = voiceSession.service();
         if (service.isNull() || voiceSession.loginSession < 0 || voiceSession.groupHandle < 0)
@@ -6463,7 +6019,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         const handle = voiceGroupHandle();
         if (!natives || !handle)
             return false;
-        // The SDK owns the request once it's issued; the setters copy the strings.
         const request = natives.newRequest();
         natives.setHandle(request, Memory.allocUtf8String(handle));
         if (path)
@@ -6488,8 +6043,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return source;
     }
 
-    // Queues a sound for conversion; `play` moves it to the front and plays it once it's ready (only
-    // the latest press plays).
     function queueSound(sound, play) {
         let job = soundboard.jobs.find((queued) => queued.sound.path === sound.path);
         if (!job) {
@@ -6505,7 +6058,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         }
     }
 
-    // Opening the Sounds page gets every sound converted in the background, so presses are instant.
     function prefetchSounds() {
         for (const sound of soundboard.sounds) {
             if (!soundboard.prepared.has(sound.path))
@@ -6609,8 +6161,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         return entries;
     }
 
-    // ─────────────────────────────── Menu (Overdose default style) ───────────────────────────────
-
     const HOME = "Home";
     const CATEGORY_PARENT = { Levels: "Spawning", Titles: "Spawning" };
     const RAIL_NORMAL = [Math.cos(LAYOUT.rail.tilt * DEG), Math.sin(LAYOUT.rail.tilt * DEG), 0];
@@ -6638,7 +6188,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         pointerTransform: NULL,
         pointerHand: NULL,
         nextCameraFix: 0,
-        // Pinned wrappers: the chrome (root, panel, rail, pages), the rows, and the pointer.
         scope: [],
         rowScope: [],
         pointerScope: [],
@@ -6694,7 +6243,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         switch (category) {
             case "Settings":
                 return [
-                    toggleEntry("custom-name", () => `Custom Name: ${customName.desired ? customName.desired.slice(0, 16) : "(set in config)"}`, "customName"),
                     incrementEntry("shoot-boost-amount", "Shoot Boost", () => `${settings.shootBoostPercent}%`, stepShootBoost),
                     incrementEntry("auto-aim-target", "Auto Aim Target", () => settings.autoAimMode === 0 ? "Swish" : "Bank Shot", stepAimMode),
                     incrementEntry("auto-aim-guide", "Bank Shot Guide", () => settings.autoAimLegit === 0 ? "Snap & Drop" : "Smooth Glide", stepAimGuide),
@@ -6724,6 +6272,7 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
                     incrementEntry("points-per-shot", "Points Per Shot",
                         () => settings.pointsPerShot === 1 ? "1 (Default)" : String(settings.pointsPerShot), stepPointsPerShot),
                     incrementEntry("hoop-hitbox-size", "Hoop Hitbox Size", () => `${settings.hoopHitbox}x`, stepHoopHitbox),
+                    toggleEntry("ownership-spam", "Ownership Spam", "ownershipSpam"),
                 ];
             case "Spawning":
                 return [
@@ -6812,10 +6361,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         }
     }
 
-    // ─────────────────────────────────── Menu drawing ───────────────────────────────────
-
-    // A rounded body plus a slightly larger, darker outline behind it, parented so both scale
-    // together during the click animation.
     function drawPanel(scope, name, parentTransform, center, rotation, size, color) {
         const body = createMeshObject(scope, name, parentTransform, center, rotation, size,
             roundedBoxMesh(size[1], size[2], THEME.cornerRadius), flatMaterial(color));
@@ -6850,7 +6395,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         drawPanel(scope, "panel", menu.layout, LAYOUT.panel.center, IDENTITY, LAYOUT.panel.size, THEME.panel);
         createText(scope, menu.canvas, MENU_TITLE, LAYOUT.title.center, LAYOUT.title.size);
 
-        // Overdose's Disconnect bar; here it shows where you are and steps back.
         const topBar = drawPanel(scope, "top-bar", menu.layout, LAYOUT.topBar.center, IDENTITY, LAYOUT.topBar.size, THEME.button);
         regions.push(clickRegion("nav-top", LAYOUT.topBar.center, LAYOUT.topBar.size, goBack, { body: topBar.transform }));
 
@@ -6901,7 +6445,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
     function renderRows() {
         destroyObject(menu.rowShapes);
         destroyObject(menu.rowText);
-        // Only chrome animations survive: the old rows are gone once their handles are released.
         menu.animations = menu.animations.filter((animation) => menu.chromeRegions.includes(animation.region));
         releaseScope(menu.rowScope);
         const shapes = createGameObject(menu.rowScope, "rows", menu.layout);
@@ -6928,8 +6471,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         menu.regions = regions;
     }
 
-    // Parenting to the hand keeps the menu glued to it without a per-frame reposition (and without
-    // a frame of lag). A hand with a mirrored or skewed scale falls back to following it manually.
     function attachMenuToHand() {
         let lossy = null;
         try {
@@ -6960,7 +6501,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         catch (_) { }
     }
 
-    // World size follows the player-size preset so the menu stays proportional to your hands.
     function refreshMenuScale() {
         if (!unityAlive(menu.rootTransform))
             return;
@@ -7000,7 +6540,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         const canvasObject = createGameObject(menu.scope, "canvas", menu.layout);
         U.canvasRenderMode(keep(menu.scope, U.addComponent(canvasObject.gameObject, typeOf(Unity.Canvas))), 2);
         U.scalerPixelsPerUnit(keep(menu.scope, U.addComponent(canvasObject.gameObject, typeOf(Unity.CanvasScaler))), 2500);
-        // Adding the Canvas swapped the Transform for a RectTransform; keep the new wrapper.
         menu.canvas = keep(menu.scope, U.gameObjectTransform(canvasObject.gameObject));
         placeLocal(menu.canvas, [0, 0, 0], IDENTITY, [1, 1, 1]);
         drawChrome();
@@ -7063,8 +6602,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         });
     }
 
-    // ─────────────────────────────────── Menu interaction ───────────────────────────────────
-
     function hitTest(point) {
         for (const region of menu.regions) {
             let dx = point[0] - region.center[0];
@@ -7112,8 +6649,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         menu.animations.length = 0;
     }
 
-    // Rows are redrawn after every press; the pressed button's replacement (same id) plays the
-    // Overdose click animation.
     function press(region, now) {
         try {
             region.run();
@@ -7237,8 +6772,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
             processPointer(now);
     }
 
-    // ──────────────────────────────────── Toggle effects ────────────────────────────────────
-
     function onToggleChanged(key, quiet = false) {
         const enabled = toggles[key];
         switch (key) {
@@ -7280,7 +6813,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
             case "unlockAll":
                 onUnlockAllChanged(enabled);
                 break;
-            // Orbit and the stack would fight over the same balls, so one switches the other off.
             case "ballOrbit":
                 if (enabled) {
                     orbit.nextScan = 0;
@@ -7342,16 +6874,12 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
             log(`${key}=${toggles[key]}`);
     }
 
-    // ───────────────────────────────────── Lifecycle ─────────────────────────────────────
-
     function onHandManagerChanged() {
         destroyPointer();
         destroyMenu();
         resetStealBall();
     }
 
-    // A map change destroys every scene object we reference; put the game back the way it was
-    // and start over from fresh references.
     function resetForSceneChange() {
         resetStealBall();
         try {
@@ -7401,10 +6929,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         activeScene = scene;
     }
 
-    // ───────────────────────────────────── Main tick ─────────────────────────────────────
-
-    // Everything here runs on the game's main thread. Each feature is isolated so one failing
-    // module can't take the others (or the menu) down with it.
     const FEATURE_UPDATES = [
         ["movement", updateMovement],
         ["steal ball", updateStealBall],
@@ -7419,8 +6943,8 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         ["hoop hitbox", updateHoopHitboxes],
         ["gold explosion", updateGoldExplosion],
         ["titles", updateTitleKeeper],
-        ["custom name", updateCustomName],
         ["soundboard", updateSoundJobs],
+        ["ownership spam", updateOwnershipSpam],
         ["ball orbit", updateBallOrbit],
         ["ball stack", updateBallStack],
         ["grip spawn", updateGripSpawn],
@@ -7440,9 +6964,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
     let lastTick = 0;
     let started = false;
 
-    // Reloading the script without restarting the game leaves the previous copy's objects in the
-    // scene. Any that are still showing (an open menu, its pointer, ESP) are removed; hidden ones
-    // stay hidden.
     function removeLeftoverObjects() {
         let removed = 0;
         for (const name of SCENE_OBJECT_NAMES) {
@@ -7454,7 +6975,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
                 catch (_) { }
                 if (!unityAlive(found))
                     break;
-                // Hidden first so Find skips it: Destroy only takes effect at the end of the frame.
                 U.setActive(found, 0);
                 destroyObject(found);
                 removed++;
@@ -7491,8 +7011,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         if (now >= refs.nextRefresh)
             refreshReferences(now);
         readInput();
-        // Network pacing and pool cleanup keep running through brief reference loss, so a
-        // sequence can't catch up later or a looping effect outlive its lifetime.
         runFeature("score effects", updatePendingScoreEffects, now, deltaTime);
         runFeature("config", updateConfigSave, now, deltaTime);
         if (!playerReady()) {
@@ -7506,8 +7024,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
             runFeature(name, update, now, deltaTime);
     }
 
-    // ──────────────────────────────────────── Boot ────────────────────────────────────────
-
     try {
         const cachedPtr = fieldOffset(Unity.Object, "m_CachedPtr");
         if (cachedPtr >= 0)
@@ -7519,7 +7035,6 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         installScoreAwardHooks();
         installScoreEffectHooks();
         installHeightHooks();
-        installCustomNameHook();
         installStealBallHook();
         const update = findMethod(Game.HeightController, "Update", 0);
         if (!update)
