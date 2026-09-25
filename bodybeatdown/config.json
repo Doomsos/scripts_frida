@@ -1,0 +1,10 @@
+{
+  "title": "Body Beat Down",
+  "target": "BeatHimUp",
+  "script": "script/buddy.js",
+  "bridge_mode": "custom",
+  "custom_bridge": "bridge/frida-il2cpp-bridge.js",
+  "sounds": "sounds",
+  "sounds_game_target": "",
+  "eternalize": false
+}

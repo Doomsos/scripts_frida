@@ -11,6 +11,16 @@
       "sounds": "bigballers/sounds",
       "sounds_game_target": "/sdcard/Android/data/com.dogelabs.bigballersbasketball/files/Overdose/Sounds",
       "eternalize": false
+    },
+    {
+      "title": "Body Beat Down",
+      "target": "BeatHimUp",
+      "script": "bodybeatdown/script/buddy.js",
+      "bridge_mode": "custom",
+      "custom_bridge": "bodybeatdown/bridge/frida-il2cpp-bridge.js",
+      "sounds": "bodybeatdown/sounds",
+      "sounds_game_target": "",
+      "eternalize": false
     }
   ]
 }
