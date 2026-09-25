@@ -1,6 +1,6 @@
 {
   "title": "Body Beat Down",
-  "target": "BeatHimUp",
+  "target": "com.armoredpigstudios.beathimup",
   "script": "script/buddy.js",
   "bridge_mode": "custom",
   "custom_bridge": "bridge/frida-il2cpp-bridge.js",

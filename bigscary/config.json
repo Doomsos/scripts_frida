@@ -1,0 +1,10 @@
+{
+  "title": "Big Scary (JaSC Menu)",
+  "target": "com.Axelmatic.Bigscary",
+  "script": "script/BigScary.js",
+  "bridge_mode": "custom",
+  "custom_bridge": "bridge/frida-il2cpp-bridge.js",
+  "sounds": "sounds",
+  "sounds_game_target": "/sdcard/Android/data/com.Axelmatic.Bigscary/files/soundboard",
+  "eternalize": false
+}
