@@ -1,0 +1,10 @@
+{
+  "title": "Animal Rivals (Rasp Menu)",
+  "target": "com.dogelabs.deadeye",
+  "script": "script/AnimalRivalsMenu.js",
+  "bridge_mode": "custom",
+  "custom_bridge": "bridge/frida-il2cpp-bridge.js",
+  "sounds": "sounds",
+  "sounds_game_target": "/sdcard/Android/data/com.dogelabs.deadeye/files/Soundboard",
+  "eternalize": false
+}

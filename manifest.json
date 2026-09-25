@@ -31,6 +31,26 @@
       "sounds": "bigscary/sounds",
       "sounds_game_target": "/sdcard/Android/data/com.Axelmatic.Bigscary/files/soundboard",
       "eternalize": false
+    },
+    {
+      "title": "Animal Rivals (Rasp Menu)",
+      "target": "com.dogelabs.deadeye",
+      "script": "animalrivals/script/AnimalRivalsMenu.js",
+      "bridge_mode": "custom",
+      "custom_bridge": "animalrivals/bridge/frida-il2cpp-bridge.js",
+      "sounds": "animalrivals/sounds",
+      "sounds_game_target": "/sdcard/Android/data/com.dogelabs.deadeye/files/Soundboard",
+      "eternalize": false
+    },
+    {
+      "title": "Blob Town (Lime Menu)",
+      "target": "app.RevelVR.blobtown",
+      "script": "blobtown/script/blobtown_menu.js",
+      "bridge_mode": "custom",
+      "custom_bridge": "blobtown/bridge/frida-il2cpp-bridge.js",
+      "sounds": "blobtown/sounds",
+      "sounds_game_target": "",
+      "eternalize": false
     }
   ]
 }

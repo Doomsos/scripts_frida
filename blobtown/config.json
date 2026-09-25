@@ -1,0 +1,10 @@
+{
+  "title": "Blob Town (Lime Menu)",
+  "target": "app.RevelVR.blobtown",
+  "script": "script/blobtown_menu.js",
+  "bridge_mode": "custom",
+  "custom_bridge": "bridge/frida-il2cpp-bridge.js",
+  "sounds": "sounds",
+  "sounds_game_target": "",
+  "eternalize": false
+}
