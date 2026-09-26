@@ -10,7 +10,8 @@
       "custom_bridge": "",
       "sounds": "bigballers/sounds",
       "sounds_game_target": "/sdcard/Android/data/com.dogelabs.bigballersbasketball/files/Overdose/Sounds",
-      "eternalize": false
+      "eternalize": false,
+      "auto_inject": true
     },
     {
       "title": "Body Beat Down",

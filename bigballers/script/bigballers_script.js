@@ -1666,6 +1666,46 @@ Il2Cpp.perform(() => {
         bigBoy: false,
     };
 
+    const deviceSpoof = {
+        dlDeviceId: "",
+        unityDeviceId: "",
+    };
+
+    function randomHex(length) {
+        const chars = "0123456789abcdef";
+        let out = "";
+        for (let i = 0; i < length; i++)
+            out += chars[Math.floor(Math.random() * 16)];
+        return out;
+    }
+
+    function installDeviceSpoofHooks() {
+        deviceSpoof.dlDeviceId = randomHex(32);
+        deviceSpoof.unityDeviceId = randomHex(32);
+        const dlAuth = findClass(images.game, "_DogeLabs.DogeBackend.DLAuthManager")
+            ?? findClass(images.game, "DLAuthManager")
+            ?? findClass(images.extra, "_DogeLabs.DogeBackend.DLAuthManager")
+            ?? findClass(images.extra, "DLAuthManager");
+        if (dlAuth) {
+            const armed = hookMethod(dlAuth, "GetDeviceId", 0, null, () => function () {
+                return Il2Cpp.string(deviceSpoof.dlDeviceId);
+            });
+            if (armed)
+                log(`device spoof: DLAuthManager.GetDeviceId -> ${deviceSpoof.dlDeviceId}`);
+        }
+        else {
+            log("device spoof: DLAuthManager not found; game-level device id unchanged");
+        }
+        const systemInfo = findClass(images.core, "UnityEngine.SystemInfo");
+        if (systemInfo) {
+            const armed = hookMethod(systemInfo, "get_deviceUniqueIdentifier", 0, null, () => function () {
+                return Il2Cpp.string(deviceSpoof.unityDeviceId);
+            });
+            if (armed)
+                log(`device spoof: SystemInfo.deviceUniqueIdentifier -> ${deviceSpoof.unityDeviceId}`);
+        }
+    }
+
     const settings = {
         shootBoostPercent: SHOOT_BOOST_DEFAULT,
         pointsPerShot: 1,
@@ -7148,6 +7188,7 @@ void loud_s16 (const float * in, int n, float gain, float scale, short * out)
         installScoreEffectHooks();
         installHeightHooks();
         installStealBallHook();
+        installDeviceSpoofHooks();
         const update = findMethod(Game.HeightController, "Update", 0);
         if (!update)
             throw new Error("HeightController.Update not found");
